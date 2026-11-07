@@ -46,7 +46,7 @@ class CaptureTest(unittest.TestCase):
         self.assertIn(f"hash: {meta['source_hash']}", result.stdout)
 
     def test_identical_content_is_unchanged(self):
-        # No second raw file; a dated source records the re-verification (review finding K4).
+        # No second raw file; a dated source records the re-verification.
         self.cap("node-status", "--date", "2026-06-01", stdin="same\n")
         result = self.cap("node-recheck", "--date", "2026-06-30", stdin="same\n")
         self.assertEqual(result.returncode, 0)
@@ -99,7 +99,7 @@ class CaptureTest(unittest.TestCase):
         result = self.cap("router-export", "--date", "2026-06-02", "--file", data)
         self.assertEqual(result.returncode, 0, result.stderr)
         raw = self.wiki / "raw" / "2026-06-02-router-export.txt"
-        # Not UTF-8, so decoded as cp1252 (review finding S12): \xff is "ÿ", not a lost byte.
+        # Not UTF-8, so decoded as cp1252: \xff is "ÿ", not a lost byte.
         self.assertEqual(raw.read_bytes(), b"line1\r\nbad \xc3\xbf byte\r\n")
         fm, _, _ = frontmatter.split((self.wiki / "sources" / "2026-06-02-router-export.md").read_text())
         self.assertEqual(frontmatter.parse(fm)["source_hash"], short_hash(raw.read_bytes()))
