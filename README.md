@@ -119,7 +119,7 @@ file:
 git remote add upstream https://github.com/rcarvalhoxavier/homelab-harness.git
 git fetch upstream
 # The upstream commit your copy was made from: the last one before your repository's first commit.
-base=$(git log upstream/main -1 --format=%H --before="$(git log --reverse --format=%cI | head -1)")
+base=$(git log upstream/main --first-parent -1 --format=%H --before="$(git log --reverse --format=%cI | head -1)")
 git merge --allow-unrelated-histories -s ours "$base" -m "Adopt upstream history"
 ```
 

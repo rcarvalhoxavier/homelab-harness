@@ -1,4 +1,8 @@
 """What a visitor sees first: the README, the agent guide and the CI gate."""
+import os
+import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,6 +48,49 @@ class ReadmeTest(unittest.TestCase):
         self.assertIn("## Contributing", readme())
         self.assertNotIn("For maintainers of the template", readme())
         self.assertNotIn("Watch the first run", readme())
+
+
+class TemplateCopyTest(unittest.TestCase):
+    """README Path 3 picks the upstream commit a copy made with the template button came from."""
+
+    def git(self, cwd, *args, date="2026-01-01T00:00:00Z"):
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="test",
+            GIT_AUTHOR_EMAIL="test@example.invalid",
+            GIT_COMMITTER_NAME="test",
+            GIT_COMMITTER_EMAIL="test@example.invalid",
+            GIT_AUTHOR_DATE=date,
+            GIT_COMMITTER_DATE=date,
+        )
+        done = subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True)
+        return done.stdout.strip()
+
+    def test_a_pull_request_merged_after_the_copy_is_not_its_base(self):
+        command = re.search(r"^base=.*$", readme(), re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream, copy = Path(tmp) / "upstream", Path(tmp) / "copy"
+            for repo in (upstream, copy):
+                repo.mkdir()
+                self.git(repo, "init", "-q", "-b", "main")
+            self.git(upstream, "commit", "-q", "--allow-empty", "-m", "A", date="2026-01-01T00:00:00Z")
+            base = self.git(upstream, "rev-parse", "HEAD")
+            # the contributor's commit predates the copy; the merge that brings it in does not
+            self.git(upstream, "switch", "-q", "-c", "pr")
+            self.git(upstream, "commit", "-q", "--allow-empty", "-m", "P", date="2026-01-02T00:00:00Z")
+            self.git(upstream, "switch", "-q", "main")
+            self.git(copy, "commit", "-q", "--allow-empty", "-m", "copy", date="2026-01-03T00:00:00Z")
+            self.git(upstream, "merge", "-q", "--no-ff", "-m", "M", "pr", date="2026-01-04T00:00:00Z")
+            self.git(copy, "remote", "add", "upstream", str(upstream))
+            self.git(copy, "fetch", "-q", "upstream", "main:refs/remotes/upstream/main")
+            found = subprocess.run(
+                ["bash", "-c", f'{command}\nprintf %s "$base"'],
+                cwd=copy,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(found, base)
 
 
 class AgentsGuideTest(unittest.TestCase):
