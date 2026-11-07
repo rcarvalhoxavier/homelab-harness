@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# pve-repo-setup: switch one node from the enterprise to the no-subscription repository (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-repo-setup <node> [--dry-run] [--yes]
+
+Disables every enabled enterprise.proxmox.com entry (Proxmox VE and Ceph) and enables
+pve-no-subscription, in the node's format: one-line .list files on Proxmox VE 8, deb822
+.sources files on 9. Then runs apt-get update and checks it reports no signature error.
+Idempotent: a configured node is left alone. It does not add a Ceph no-subscription
+repository; Ceph users choose their own. A source file it cannot interpret with certainty
+(CRLF line endings, URIs on continuation lines, a field without a space after the colon,
+proxmox.com in capital letters) stops the tool
+before anything is written: fix that file by hand first.
+EOF
+}
+
+ENTERPRISE='enterprise\.proxmox\.com'
+NOSUB_URI='download\.proxmox\.com/debian/pve'
+NOSUB_COMP='pve-no-subscription'
+
+# apt_read DIR FAIL: read every APT source of $node into DIR; on any doubt call FAIL (a function that exits).
+apt_read() {
+  local dir="$1" fail="$2" n path size variants
+  # pve_apt_fetch fails unless /etc/apt/sources.list was read or is absent (cat exit 1)
+  pve_apt_fetch "$node" "$dir" || "$fail" "cannot read the APT sources of $node"
+  size=0
+  while read -r n path; do
+    size=$((size + $(wc -c < "$dir/$n")))
+    # Constructs the library does not interpret: never report "configured" or write over them.
+    grep -qi 'proxmox\.com' "$dir/$n" || continue
+    variants="$(grep -Eio '[[:alnum:].-]*proxmox\.com' "$dir/$n")"
+    if [[ "$variants" != "${variants,,}" ]]; then
+      "$fail" "$path spells a proxmox.com host name with capital letters: fix it by hand first"
+    fi
+    if grep -q $'\r' "$dir/$n"; then
+      "$fail" "$path has CRLF line endings: fix it by hand first"
+    fi
+    if [[ "$path" == *.sources ]]; then
+      if grep -Eq '^[[:space:]]+[^[:space:]#]' "$dir/$n"; then
+        "$fail" "$path has continuation lines: fix it by hand first"
+      fi
+      if grep -Eq '^[A-Za-z][A-Za-z0-9-]*:[^[:space:]]' "$dir/$n"; then
+        "$fail" "$path has a field without a space after the colon: fix it by hand first"
+      fi
+    fi
+  done < "$dir/index"
+  ((size > 0)) || "$fail" "the APT sources of $node are all empty: refusing to guess"
+}
+
+main() {
+  local -a orig=("$@") enterprise
+  local node out major codename dir path n last after rc text
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]+"${PVE_ARGS[@]}"}"
+  PVE_ARGS=()
+  while (($# > 0)); do
+    case "$1" in
+      -*) pve_usage_error "unknown option: $1" ;;
+      *) PVE_ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#PVE_ARGS[@]} == 1)) || pve_usage_error "expected one node"
+  node="${PVE_ARGS[0]}"
+  pve_init pve-repo-setup "${orig[@]}"
+  pve_target_node "$node"
+  out="$(pve_collect "$node" pveversion)" || pve_check_fail "$node is unreachable"
+  [[ -n "$out" ]] || pve_check_fail "pveversion on $node returned nothing"
+  major="$(pve_major_version <<< "$out")"
+  [[ "$major" == 8 || "$major" == 9 ]] || pve_check_fail "unsupported Proxmox VE version: ${out%% *}"
+  pve_check_ok "Proxmox VE $major"
+  [[ "$major" != 9 ]] || pve_check_warn "Proxmox VE 9 support is experimental (not yet verified on a real node)"
+  out="$(pve_collect "$node" cat /etc/os-release)" || pve_check_fail "cannot read /etc/os-release on $node"
+  codename="$(sed -n 's/^VERSION_CODENAME=//p' <<< "$out" | tr -d '"')"
+  [[ "$codename" =~ ^[a-z]+$ ]] || pve_check_fail "cannot read VERSION_CODENAME from /etc/os-release"
+  case "$major:$codename" in
+    8:bookworm|9:trixie) ;;
+    *) pve_check_fail "Proxmox VE $major does not match Debian $codename (expected 8 with bookworm, 9 with trixie)" ;;
+  esac
+  pve_check_ok "Debian $codename"
+  dir="$(mktemp -d)"
+  pve_cleanup_add "$dir"
+  apt_read "$dir" pve_check_fail
+  pve_plan_reset
+  pve_hint target "node $node"
+  pve_hint path standard
+  pve_hint rollback "write back the previous files, which bin/pve-state $node lists under apt sources"
+  pve_hint baseline/after "bin/pve-state $node"
+  # an entry for another suite (left over from an upgrade) is never "configured", and never guessed
+  while read -r path text; do
+    if [[ "$text" != "$codename" ]]; then
+      pve_check_fail "$path enables pve-no-subscription for $text, not $codename: fix it by hand first"
+    fi
+  done < <(pve_apt_suites "$dir" "$NOSUB_URI" "$NOSUB_COMP")
+  mapfile -t enterprise < <(pve_apt_enabled "$dir" "$ENTERPRISE" '.')
+  for path in "${enterprise[@]+"${enterprise[@]}"}"; do
+    n="$(awk -v p="$path" '$2 == p { print $1 }' "$dir/index")"
+    pve_apt_disable "$dir/$n" "$path" "$ENTERPRISE" > "$dir/$n.new"
+    pve_plan_put "$node" "$dir/$n.new" "$path" 0644
+  done
+  if [[ -z "$(pve_apt_enabled "$dir" "$NOSUB_URI" "$NOSUB_COMP")" ]]; then
+    if [[ "$major" == 8 ]]; then
+      path=/etc/apt/sources.list.d/pve-no-subscription.list
+      printf 'deb http://download.proxmox.com/debian/pve %s pve-no-subscription\n' "$codename" > "$dir/nosub"
+    else
+      path=/etc/apt/sources.list.d/pve-no-subscription.sources
+      printf 'Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: %s\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n' \
+        "$codename" > "$dir/nosub"
+    fi
+    # Never overwrite a file of that name that exists but does not enable the repository.
+    if awk -v p="$path" '$2 == p { f = 1 } END { exit !f }' "$dir/index"; then
+      pve_check_fail "$path exists but does not enable pve-no-subscription: fix it by hand first"
+    fi
+    pve_plan_put "$node" "$dir/nosub" "$path" 0644
+  fi
+  if ((${#PVE_PLAN[@]} == 0)); then
+    printf 'already configured: no enterprise entry enabled, pve-no-subscription enabled\n'
+    exit 0
+  fi
+  last="${#PVE_PLAN[@]}"
+  # LC_ALL=C: the signature scan below reads untranslated apt messages
+  pve_plan_add "$node" env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get update
+  pve_plan_execute "Rewrite the APT sources of $node and run apt-get update?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  after="$(mktemp -d)"
+  pve_cleanup_add "$after"
+  apt_read "$after" pve_verify_fail
+  if [[ -z "$(pve_apt_enabled "$after" "$ENTERPRISE" '.')" ]]; then
+    pve_verify_ok "no enterprise entry enabled"
+  else
+    pve_verify_fail "an enterprise entry is still enabled"
+  fi
+  if pve_apt_suites "$after" "$NOSUB_URI" "$NOSUB_COMP" | awk -v c="$codename" '$2 == c { f = 1 } END { exit !f }'; then
+    pve_verify_ok "pve-no-subscription enabled"
+  else
+    pve_verify_fail "pve-no-subscription is not enabled"
+  fi
+  text="$(cat "${PVE_STEP_OUT[$last]}")" || pve_verify_fail "cannot read the output of apt-get update"
+  [[ -n "$text" ]] || pve_verify_fail "apt-get update printed nothing"
+  rc=0
+  grep -Eq 'NO_PUBKEY|GPG error|EXPKEYSIG|BADSIG|not signed|401[[:space:]]+Unauthorized' <<< "$text" || rc=$?
+  case "$rc" in
+    1) ;;
+    0) pve_verify_fail "apt-get update reported a signature or authorization error" ;;
+    *) pve_verify_fail "cannot scan the output of apt-get update" ;;
+  esac
+  pve_verify_ok "apt-get update without signature errors"
+}
+
+main "$@"

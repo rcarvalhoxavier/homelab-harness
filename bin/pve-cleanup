@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# pve-cleanup: apt-get autoremove and clean on one node or one container (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOS'
+Usage: pve-cleanup <node|vmid> [--node NODE] [--dry-run] [--yes]
+
+Removes packages nothing depends on and empties the package cache (apt-get autoremove, apt-get
+clean) on one node, or inside one running container that uses apt. Reports the space freed on
+a node's root filesystem. It removes no snapshot, no backup and no guest data.
+EOS
+}
+
+AUTOREMOVE=(env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove)
+
+# available NODE: free bytes on / (empty answer or failed read = failure)
+available() {
+  local out parsed avail
+  out="$(pve_collect "$1" df -P -B1 /)" || return 1
+  parsed="$(pve_parse_df <<< "$out")"
+  avail="$(awk '{ print $3 }' <<< "$parsed")"
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$avail"
+}
+
+cleanup_ct() {
+  local id="$1" node config ostype status
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  [[ "$PVE_GUEST_TYPE" == ct ]] || pve_check_fail "$id is a VM: pve-cleanup works on nodes and containers"
+  config="$(pve_collect "$node" pct config "$id")" || pve_check_fail "cannot read the config of ct $id"
+  [[ -n "$config" ]] || pve_check_fail "cannot read the config of ct $id: empty answer"
+  ostype="$(pve_config_value ostype <<< "$config")"
+  [[ "$ostype" =~ ^(debian|ubuntu|devuan)$ ]] || pve_check_fail "ct $id runs '${ostype:-unknown}': apt only"
+  status="$(pve_guest_status "$node" ct "$id")" || pve_check_fail "cannot read the status of ct $id"
+  [[ -n "$status" ]] || pve_check_fail "cannot read the status of ct $id: empty answer"
+  [[ "$status" == running ]] || pve_check_fail "ct $id is $status: start it first"
+  pve_check_ok "ct $id on $node runs $ostype and is running"
+  pve_plan_reset
+  pve_hint target "ct $id on $node"
+  pve_hint path trivial
+  pve_hint rollback "none: only unused packages and the package cache are removed"
+  pve_hint baseline/after "bin/pve-state $id"
+  pve_plan_add "$node" pct exec "$id" -- "${AUTOREMOVE[@]}"
+  pve_plan_add "$node" pct exec "$id" -- apt-get clean
+  pve_plan_execute "Clean the packages of ct $id on $node?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  pve_verify_ok "every step succeeded"
+}
+
+# removal_guard NODE: simulates the autoremove through the collect alias and passes it through the
+# shared removal guard (lib/pve); shows the list.
+removal_guard() {
+  local node="$1" out
+  out="$(pve_collect "$node" apt-get -s autoremove)" || pve_check_fail "the autoremove simulation failed on $node"
+  pve_removal_guard "$node" autoremove "$out"
+  if ((PVE_REMOVAL_COUNT == 0)); then
+    pve_check_ok "the autoremove simulation removes no package"
+  else
+    pve_check_ok "the autoremove would remove $PVE_REMOVAL_COUNT package(s): $PVE_REMOVALS"
+  fi
+}
+
+cleanup_node() {
+  local node="$1" before after freed
+  pve_target_node "$node"
+  pve_reachable "$node" || pve_check_fail "$node is unreachable"
+  pve_check_ok "$node is reachable"
+  before="$(available "$node")" || pve_check_fail "cannot read the free space of / on $node"
+  removal_guard "$node"
+  pve_plan_reset
+  pve_hint target "node $node"
+  pve_hint path trivial
+  pve_hint rollback "none: only unused packages and the package cache are removed"
+  pve_hint baseline/after "bin/pve-state $node"
+  pve_plan_add "$node" "${AUTOREMOVE[@]}"
+  pve_plan_add "$node" apt-get clean
+  pve_plan_execute "Clean the packages of $node?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  after="$(available "$node")" || pve_verify_fail "cannot read the free space of / on $node after the cleanup"
+  freed=$((after - before))
+  if ((freed > 0)); then
+    pve_verify_ok "$(pve_gib "$freed") GiB freed on /"
+  else
+    pve_verify_ok "no space freed on / ($(pve_gib "$((-freed))") GiB used by other activity meanwhile)"
+  fi
+}
+
+main() {
+  local -a orig=("$@")
+  pve_cli_parse "$@"
+  ((${#PVE_ARGS[@]} == 1)) || pve_usage_error "expected one node or VMID"
+  [[ "${PVE_ARGS[0]}" != -* ]] || pve_usage_error "unknown option: ${PVE_ARGS[0]}"
+  pve_init pve-cleanup "${orig[@]}"
+  if [[ "${PVE_ARGS[0]}" =~ ^[0-9]+$ ]]; then
+    cleanup_ct "${PVE_ARGS[0]}"
+  else
+    cleanup_node "${PVE_ARGS[0]}"
+  fi
+}
+
+main "$@"

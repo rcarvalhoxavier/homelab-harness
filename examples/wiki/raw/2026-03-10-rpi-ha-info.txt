@@ -1,0 +1,16 @@
+$ ha core info
+arch: aarch64
+boot: true
+image: ghcr.io/home-assistant/raspberrypi4-64-homeassistant
+ip_address: 10.0.0.20
+machine: raspberrypi4-64
+port: 8123
+ssl: false
+version: 2026.3.1
+version_latest: 2026.3.1
+$ ha os info
+board: rpi4-64
+boot: A
+data_disk: /dev/sda
+version: 15.0
+version_latest: 15.0

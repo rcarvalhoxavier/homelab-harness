@@ -1,0 +1,8 @@
+$ pvesm status
+Name              Type     Status           Total            Used       Available        %
+data-dir           dir     active       942827764       401233600       541594164   42.56%
+local              dir     active        98559220        21340112        77219108   21.65%
+local-lvm      lvmthin     active       351797248       219521484       132275764   62.40%
+nas-backup         nfs     active      3906250000      1210937500      2695312500   31.00%
+$ qm snapshot 200 probe
+snapshot feature for disk 'data-dir:200/vm-200-disk-1.raw' is not available

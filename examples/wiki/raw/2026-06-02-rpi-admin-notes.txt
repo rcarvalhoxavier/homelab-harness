@@ -1,0 +1,3 @@
+The Raspberry Pi is a 4 GB Pi 4 booting from a USB SSD, plugged into the same UPS as pve1.
+It runs Home Assistant OS with the Mosquitto broker add-on; Zigbee goes through a USB dongle
+on the Pi. I set it up in 2025 and never moved it to Proxmox because of the dongle.

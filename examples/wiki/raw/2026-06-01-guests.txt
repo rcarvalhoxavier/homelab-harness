@@ -1,0 +1,6 @@
+vmid  type  node  name     status   maxmem(MiB)  storage
+101   lxc   pve1  pihole   running  1024         local-lvm
+102   lxc   pve2  pihole2  running  512          local-lvm
+105   lxc   pve1  media    running  8192         local-lvm
+106   lxc   pve1  docker   running  12288        local-lvm
+200   qemu  pve1  nas      running  16384        local-lvm,data-dir

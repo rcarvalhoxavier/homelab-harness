@@ -1,0 +1,14 @@
+$ pihole -v
+Core version is v6.1.2 (Latest: v6.1.2)
+Web version is v6.2.1 (Latest: v6.2.1)
+FTL version is v6.1 (Latest: v6.1)
+$ pihole status
+  [✓] FTL is listening on port 53
+     [✓] UDP (IPv4)
+     [✓] TCP (IPv4)
+  [✓] Pi-hole blocking is enabled
+$ dig +short @127.0.0.1 nas.lab.example
+10.0.0.30
+$ pct listsnapshot 101
+`-> pre-pihole-v6                  2026-06-14 20:05:31     before the v6 upgrade
+    `-> current                                             You are here!

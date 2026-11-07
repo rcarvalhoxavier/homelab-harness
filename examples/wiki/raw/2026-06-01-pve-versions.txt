@@ -1,0 +1,10 @@
+== pve1
+pve-manager/8.4.1/2a5fa54a8503f96d (running kernel: 6.8.12-10-pve)
+               total        used        free      shared  buff/cache   available
+Mem:           31958       29870         412         188        2102        2088
+Swap:           8191        6210        1981
+== pve2
+pve-manager/8.4.1/2a5fa54a8503f96d (running kernel: 6.8.12-10-pve)
+               total        used        free      shared  buff/cache   available
+Mem:           15894        6124        7311         102        2459        9770
+Swap:           8191           0        8191

@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# pve-health: daily health of every node, with CRIT and WARN findings (read-only).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF2'
+Usage: pve-health [--node NODE] [--today YYYY-MM-DD] [--quiet]
+
+Health of each node: version, storage use, ZFS pools, memory, root filesystem, quorum, guests
+not running, and the latest backup of each guest (when PVE_BACKUP_STORAGE is set). Findings are
+"finding CRIT" or "finding WARN" lines. --today fixes the date that backup ages count from.
+A node that cannot be reached prints UNREACHABLE; a read that fails on a node that answered is
+a CRIT finding ("could not read ..."), never an OK line.
+
+Exit 0 without CRIT, 1 with a CRIT or an unreachable node, 2 on a usage or configuration error.
+Read-only: uses the collect alias only.
+EOF2
+}
+
+CRIT=0
+WARN=0
+UNREACHABLE=0
+FINDINGS=()
+ERRFILE=""
+
+finding() {
+  FINDINGS+=("finding $1 $2")
+  if [[ "$1" == CRIT ]]; then
+    CRIT=$((CRIT + 1))
+  else
+    WARN=$((WARN + 1))
+  fi
+}
+
+# A failed read after the node answered is a CRIT finding (lib/pve/pve.sh: pve_must_read).
+pve_read_failed() {
+  finding CRIT "could not read $1 on $PVE_READ_NODE"
+}
+
+# health_backups TODAY GUESTS STORAGE: STORAGE is the output of pvesm status, which lists only the
+# storages enabled for this node. Absent there, the backup storage is "unavailable" (a WARN); listed
+# but not active, it is a WARN naming its state; any failure to list an active storage is a failed
+# read (a CRIT), as in pve-state.
+health_backups() {
+  local today="$1" guests="$2" storage="$3" volid vmid type name date age today_days state rc=0
+  local -A latest=()
+  state="$(pve_parse_pvesm_status <<< "$storage" | awk -v s="$PVE_BACKUP_STORAGE" '$1 == s { print $3 }')"
+  if [[ -n "$state" && "$state" != active ]]; then
+    printf 'backups: %s %s on this node\n' "$PVE_BACKUP_STORAGE" "$state"
+    finding WARN "backup storage $PVE_BACKUP_STORAGE is $state on $PVE_READ_NODE"
+    return 0
+  fi
+  pve_opt_read "backups" pvesm list "$PVE_BACKUP_STORAGE" --content backup || rc=$?
+  if ((rc == 1)); then
+    return 0
+  elif ((rc == 2)); then
+    if [[ -n "$(pve_parse_pvesm_status <<< "$storage")" ]] &&
+      ! awk -v s="$PVE_BACKUP_STORAGE" '$1 == s { f = 1 } END { exit !f }' < <(pve_parse_pvesm_status <<< "$storage"); then
+      printf 'backups: %s unavailable on this node\n' "$PVE_BACKUP_STORAGE"
+      finding WARN "backup storage $PVE_BACKUP_STORAGE unavailable on $PVE_READ_NODE"
+    else
+      pve_read_replay
+      pve_read_failed backups
+    fi
+    return 0
+  fi
+  # keyed by type and VMID: a backup volid does not name the node, but it tells a CT from a VM
+  while read -r volid _ _ _ vmid; do
+    date="$(pve_backup_volid_date "$volid")" || continue
+    type="$(pve_backup_volid_type "$volid")" || continue
+    if [[ "$date" > "${latest[$type $vmid]:-}" ]]; then
+      latest[$type $vmid]="$date"
+    fi
+  done < <(pve_parse_pvesm_list <<< "$PVE_READ_OUT")
+  today_days="$(pve_days "$today")"
+  while read -r vmid type _ name; do
+    [[ -n "$vmid" ]] || continue
+    date="${latest[$type $vmid]:-}"
+    if [[ -z "$date" ]]; then
+      printf 'backup %s %s none\n' "$type" "$vmid"
+      finding WARN "$type $vmid ($name) has no backup on $PVE_BACKUP_STORAGE"
+      continue
+    fi
+    printf 'backup %s %s %s\n' "$type" "$vmid" "$date"
+    age=$((today_days - $(pve_days "$date")))
+    if ((age > PVE_BACKUP_MAX_AGE_DAYS)); then
+      finding WARN "$type $vmid ($name) latest backup is $age days old"
+    fi
+  done <<< "$guests"
+}
+
+health_node() {
+  local node="$1" today="$2" name type status pct cap health rc
+  local mem_total mem_used swap_total swap_used fs_avail fs_pct
+  local guests rd_guests vmid gtype gstatus gname line storage=""
+  FINDINGS=()
+  PVE_READ_NODE="$node"
+  printf '== node %s\n' "$node"
+  if ! pve_reachable "$node"; then
+    printf 'UNREACHABLE\n'
+    UNREACHABLE=$((UNREACHABLE + 1))
+    return 0
+  fi
+  if pve_must_read version pveversion; then
+    if [[ -n "${PVE_READ_OUT%%$'\n'*}" ]]; then
+      printf 'version: %s\n' "${PVE_READ_OUT%%$'\n'*}"
+    else
+      finding CRIT "could not read version on $node"
+    fi
+  fi
+  if pve_must_read storage pvesm status; then
+    storage="$PVE_READ_OUT"
+    if [[ -z "$(pve_parse_pvesm_status <<< "$PVE_READ_OUT")" ]]; then
+      finding CRIT "could not read storage on $node"
+    fi
+    while read -r name type status _ _ _ pct; do
+      [[ -n "$name" ]] || continue
+      if [[ "$pct" == - ]]; then
+        printf 'storage %s %s %s -\n' "$name" "$type" "$status"
+        # disabled is a choice; the backup storage gets its WARN in health_backups
+        if [[ "$status" == inactive && "$name" != "${PVE_BACKUP_STORAGE:-}" ]]; then
+          finding WARN "storage $name is inactive on $node"
+        fi
+        continue
+      fi
+      printf 'storage %s %s %s %s%%\n' "$name" "$type" "$status" "$pct"
+      if pve_num_gt "$pct" "$PVE_STORAGE_WARN_PCT"; then
+        finding CRIT "storage $name at $pct% (limit $PVE_STORAGE_WARN_PCT%)"
+      fi
+    done < <(pve_parse_pvesm_status <<< "$PVE_READ_OUT")
+  fi
+  rc=0
+  pve_zpool_read "$storage" || rc=$?
+  if ((rc == 0)); then
+    while read -r name _ _ _ cap health; do
+      [[ -n "$name" ]] || continue
+      printf 'zpool %s %s%% %s\n' "$name" "$cap" "$health"
+      if [[ "$health" != ONLINE ]]; then
+        finding CRIT "zpool $name is $health"
+      fi
+      if pve_num_gt "$cap" "$PVE_STORAGE_WARN_PCT"; then
+        finding CRIT "zpool $name at $cap% (limit $PVE_STORAGE_WARN_PCT%)"
+      fi
+    done < <(pve_parse_zpool <<< "$PVE_READ_OUT")
+  fi
+  if pve_must_read memory free -b; then
+    read -r mem_total mem_used swap_total swap_used <<< "$(pve_parse_free <<< "$PVE_READ_OUT")"
+    if grep -q '^Mem:' <<< "$PVE_READ_OUT" && [[ "$mem_total" =~ ^[0-9]+$ && "$mem_total" -gt 0 && "$mem_used" =~ ^[0-9]+$ &&
+      "$swap_total" =~ ^[0-9]+$ && "$swap_used" =~ ^[0-9]+$ ]]; then
+      printf 'memory: %s GiB total, %s GiB used; swap %s GiB total, %s GiB used\n' \
+        "$(pve_gib "$mem_total")" "$(pve_gib "$mem_used")" "$(pve_gib "$swap_total")" "$(pve_gib "$swap_used")"
+    else
+      finding CRIT "could not read memory on $node"
+    fi
+  fi
+  if pve_must_read rootfs df -P -B1 /; then
+    read -r _ _ fs_avail fs_pct <<< "$(pve_parse_df <<< "$PVE_READ_OUT")"
+    if [[ "$fs_pct" =~ ^[0-9]+$ && "$fs_avail" =~ ^[0-9]+$ ]]; then
+      printf 'rootfs: %s%% used, %s GiB available\n' "$fs_pct" "$(pve_gib "$fs_avail")"
+      if pve_num_gt "$fs_pct" "$PVE_STORAGE_WARN_PCT"; then
+        finding CRIT "root filesystem at $fs_pct% (limit $PVE_STORAGE_WARN_PCT%)"
+      fi
+    else
+      finding CRIT "could not read rootfs on $node"
+    fi
+  fi
+  pve_quorum "$node"
+  case "$PVE_QUORUM_STATE" in
+    cluster)
+      printf 'quorum: %s/%s votes, quorate %s\n' "$PVE_QUORUM_TOTAL" "$PVE_QUORUM_EXPECTED" "$PVE_QUORUM_QUORATE"
+      if [[ "$PVE_QUORUM_QUORATE" != Yes ]]; then
+        finding CRIT "cluster not quorate ($PVE_QUORUM_TOTAL of $PVE_QUORUM_EXPECTED votes)"
+      fi
+      ;;
+    standalone) printf 'quorum: standalone\n' ;;
+    *) finding CRIT "could not read quorum on $node" ;;
+  esac
+  guests=""
+  if rd_guests=$(pve_guests "$node" 2> "$ERRFILE"); then
+    guests="$rd_guests"
+    while read -r vmid gtype gstatus gname; do
+      [[ -n "$vmid" ]] || continue
+      printf 'guest %s %s %s %s\n' "$gtype" "$vmid" "$gname" "$gstatus"
+      if [[ "$gstatus" != running ]]; then
+        finding WARN "$gtype $vmid ($gname) is $gstatus"
+      fi
+    done <<< "$guests"
+    if [[ -n "$PVE_BACKUP_STORAGE" ]]; then
+      health_backups "$today" "$guests" "$storage"
+    fi
+  else
+    cat "$ERRFILE" >&2
+    finding CRIT "could not read guests on $node"
+  fi
+  for line in "${FINDINGS[@]}"; do
+    printf '%s\n' "$line"
+  done
+}
+
+main() {
+  local -a orig=("$@")
+  local only="" today="" node
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --today)
+        (($# >= 2)) || pve_usage_error "$1 needs a value"
+        today="$2"
+        shift 2
+        ;;
+      *) pve_usage_error "unknown argument: $1" ;;
+    esac
+  done
+  if [[ -n "$today" && ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    pve_usage_error "--today must be YYYY-MM-DD"
+  fi
+  [[ -n "$today" ]] || today="$(date +%Y-%m-%d)"
+  pve_init pve-health "${orig[@]}"
+  only="$PVE_NODE_OPT"
+  ERRFILE="$(mktemp)"
+  pve_cleanup_add "$ERRFILE"
+  printf 'pve-health 1 | %s\n' "$today"
+  for node in "${PVE_NODE_LIST[@]}"; do
+    if [[ -z "$only" || "$node" == "$only" ]]; then
+      health_node "$node" "$today"
+    fi
+  done
+  printf 'summary: %d CRIT, %d WARN, %d unreachable\n' "$CRIT" "$WARN" "$UNREACHABLE"
+  if ((CRIT > 0 || UNREACHABLE > 0)); then
+    exit 1
+  fi
+}
+
+main "$@"

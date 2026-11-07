@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# pve-move-disk: move one volume of one guest to another storage (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOS'
+Usage: pve-move-disk <vmid> <storage> [--node NODE] [--volume KEY] [--delete-source] [--dry-run] [--yes]
+
+Moves one volume (default: rootfs for a container; the first of scsi0, virtio0, sata0, ide0 for
+a VM) to another storage. A running container is shut down cleanly (pct shutdown --timeout 120,
+never a forced stop), moved and started again; a VM moves online. The source volume stays in
+the config as an unused disk, so the move can be undone, unless --delete-source is given.
+Checks that the target is active, accepts the content and has room.
+EOS
+}
+
+volume_line() { # VOLUMES KEY -> "key storage volume size"
+  awk -v key="$2" '$1 == key { print; exit }' <<< "$1"
+}
+
+# recover NODE ID: the move failed after the clean shutdown; start the container again.
+recover() {
+  local node="$1" id="$2" rcs=0 now=""
+  now="$(pve_guest_status "$node" ct "$id")" || now=""
+  if [[ -z "$now" ]]; then
+    printf 'ct %s state is unknown (status could not be read); check it and run pct start %s if it is stopped\n' "$id" "$id"
+    return 0
+  fi
+  if [[ "$now" == running ]]; then
+    printf 'ct %s is still running: the shutdown did not happen; the move did not complete\n' "$id"
+    return 0
+  fi
+  _pve_alias_of "$node" admin
+  printf 'recovery: ssh %s -- pct start %s\n' "$REPLY" "$id"
+  pve_admin "$node" pct start "$id" 2>&1 || rcs=$?
+  printf 'result: exit %d\n' "$rcs"
+  if ((rcs == 0)); then
+    printf 'ct %s is running again; the move did not complete\n' "$id"
+  else
+    printf 'ct %s was shut down and is still stopped: pct start %s\n' "$id" "$id"
+  fi
+}
+
+main() {
+  local -a orig=("$@") positional=() delete_flag=()
+  local key="" delete=0 id target node type cli config volumes line src volume size tline tstate tavail
+  local bytes content need spct status running=0 candidate after lock parent rc=0
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]+"${PVE_ARGS[@]}"}"
+  while (($# > 0)); do
+    case "$1" in
+      --volume)
+        (($# >= 2)) || pve_usage_error "--volume needs a value"
+        key="$2"
+        shift 2
+        ;;
+      --delete-source) delete=1; shift ;;
+      -*) pve_usage_error "unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  ((${#positional[@]} == 2)) || pve_usage_error "expected <vmid> <storage>"
+  id="${positional[0]}"
+  target="${positional[1]}"
+  [[ "$id" =~ ^[0-9]{1,9}$ ]] || pve_usage_error "invalid VMID: $id"
+  [[ "$target" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,63}$ ]] || pve_usage_error "invalid storage name: $target"
+  [[ -z "$key" || "$key" =~ ^[a-z]+[0-9]*$ ]] || pve_usage_error "invalid volume key: $key"
+  pve_init pve-move-disk "${orig[@]}"
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  type="$PVE_GUEST_TYPE"
+  cli="$(pve_cli_of "$type")"
+  config="$(pve_collect "$node" "$cli" config "$id")" || pve_check_fail "cannot read the config of $type $id"
+  [[ -n "$config" ]] || pve_check_fail "cannot read the config of $type $id: empty answer"
+  volumes="$(pve_parse_config_volumes <<< "$config")"
+  lock="$(pve_config_value lock <<< "$config")"
+  [[ -z "$lock" ]] || pve_check_fail "$type $id is locked ($lock): the move would fail"
+  parent="$(pve_config_value parent <<< "$config")"
+  if ((delete == 1)) && [[ -n "$parent" ]]; then
+    pve_check_fail "$type $id has snapshots: --delete-source is refused for a volume with snapshots; move without it"
+  fi
+  if [[ -z "$key" && "$type" == ct ]]; then
+    key=rootfs
+  elif [[ -z "$key" ]]; then
+    for candidate in scsi0 virtio0 sata0 ide0; do
+      if [[ -n "$(volume_line "$volumes" "$candidate")" ]]; then
+        key="$candidate"
+        break
+      fi
+    done
+  fi
+  line="$(volume_line "$volumes" "$key")"
+  [[ -n "$key" && -n "$line" ]] || pve_check_fail "$type $id has no volume ${key:-to move}"
+  read -r _ src volume size <<< "$line"
+  if [[ "$src" == "$target" ]]; then
+    printf 'already on %s: nothing to do\n' "$target"
+    exit 0
+  fi
+  pve_check_ok "$key of $type $id is $src:$volume ($size)"
+  tline="$(pve_storage_line "$node" "$target")" || pve_check_fail "storage $target is not configured on $node"
+  read -r _ _ tstate _ _ tavail _ <<< "$tline"
+  [[ "$tstate" == active ]] || pve_check_fail "storage $target is $tstate on $node"
+  [[ "$tavail" =~ ^[0-9]+$ ]] || pve_check_fail "cannot read the free space of storage $target"
+  bytes="$(pve_size_bytes "$size")" || pve_check_fail "cannot read the size of $key ($size)"
+  if ((tavail * 1024 < bytes)); then
+    pve_check_fail "storage $target has $(pve_gib "$((tavail * 1024))") GiB free; $key needs $(pve_gib "$bytes") GiB"
+  fi
+  pve_check_ok "storage $target is active with room for $key"
+  if [[ "$type" == ct ]]; then need=rootdir; else need=images; fi
+  content="$(pve_storage_content "$node" "$target")" || pve_check_fail "storage $target is not in storage.cfg"
+  [[ ",$content," == *",$need,"* ]] || pve_check_fail "storage $target does not accept $need (content: $content)"
+  pve_check_ok "storage $target accepts $need"
+  spct="$(pve_storage_line "$node" "$src" | awk '{ print $7 }')" || spct="-"
+  if [[ "$spct" =~ ^[0-9.]+$ ]] && pve_num_gt "$spct" 95; then
+    pve_check_warn "the source storage $src is at $spct%: the move may fail; stop non-essential guests first"
+  fi
+  status="$(pve_guest_status "$node" "$type" "$id")" || pve_check_fail "cannot read the status of $type $id"
+  [[ -n "$status" ]] || pve_check_fail "cannot read the status of $type $id: empty answer"
+  if [[ "$status" == running ]]; then running=1; fi
+  pve_plan_reset
+  pve_hint target "$type $id on $node"
+  pve_hint path risky
+  if ((delete == 1)); then
+    pve_hint rollback "none: --delete-source removes the source volume; take bin/pve-backup $id first"
+    delete_flag=(--delete 1)
+  else
+    pve_hint rollback "the source volume stays in the config as an unused disk on $src: reattach it, or move back with bin/pve-move-disk $id $src --volume $key"
+  fi
+  pve_hint baseline/after "bin/pve-state $id"
+  if [[ "$type" == ct ]]; then
+    if ((running == 1)); then pve_plan_add "$node" pct shutdown "$id" --timeout 120; fi
+    pve_plan_add "$node" pct move-volume "$id" "$key" "$target" ${delete_flag[@]+"${delete_flag[@]}"}
+    if ((running == 1)); then pve_plan_add "$node" pct start "$id"; fi
+  else
+    pve_plan_add "$node" qm disk move "$id" "$key" "$target" ${delete_flag[@]+"${delete_flag[@]}"}
+  fi
+  pve_plan_execute "Move $key of $type $id from $src to $target?" || rc=$?
+  if ((rc != 0)); then
+    # a failure at or after the shutdown, before pct start: bring the container back
+    if [[ "$type" == ct ]] && ((running == 1 && PVE_DRY_RUN == 0)) && [[ -n "${PVE_STEP_OUT[0]:-}" && -z "${PVE_STEP_OUT[2]:-}" ]]; then
+      recover "$node" "$id"
+    fi
+    exit 1
+  fi
+  ((PVE_DRY_RUN == 0)) || exit 0
+  config="$(pve_collect "$node" "$cli" config "$id")" || pve_verify_fail "cannot read the config of $type $id after the move"
+  [[ -n "$config" ]] || pve_verify_fail "cannot read the config of $type $id after the move: empty answer"
+  after="$(volume_line "$(pve_parse_config_volumes <<< "$config")" "$key" | awk '{ print $2 }')"
+  if [[ "$after" == "$target" ]]; then
+    pve_verify_ok "$key of $type $id is on $target"
+  else
+    pve_verify_fail "$key of $type $id is still on ${after:-an unknown storage}"
+  fi
+  if ((running == 1)); then
+    status="$(pve_guest_status "$node" "$type" "$id")" || status="unknown"
+    if [[ "$status" == running ]]; then
+      pve_verify_ok "$type $id is running"
+    else
+      pve_verify_fail "$type $id is ${status:-unknown} after the move"
+    fi
+  fi
+}
+
+main "$@"

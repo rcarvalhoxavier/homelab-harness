@@ -1,0 +1,10 @@
+== query counts, 2026-06-13..2026-06-20
+ct-101 (10.0.0.53): 412381 queries
+ct-102 (10.0.0.54):  38907 queries
+== local DNS records
+ct-101: 14 records
+ct-102: 11 records
+== present on ct-101, missing on ct-102
+nas.lab.example        10.0.0.30
+rpi.lab.example        10.0.0.20
+backup.lab.example     10.0.0.30

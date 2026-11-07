@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# pve-snapshot: snapshot one guest (changing tool: admin alias, --dry-run, --yes).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-snapshot <vmid> <name> [--node NODE] [--dry-run] [--yes]
+
+Takes a snapshot of one container or VM, after checking that the name is valid and unused and
+that every disk is on a storage that can snapshot it. --dry-run runs the checks and prints the
+exact command. Without --yes it asks on a terminal, and refuses (exit 2) without one.
+Name: a letter, then letters, digits, - or _ (2 to 40 characters); current, pending and vzdump
+are reserved (a later vzdump removes a snapshot named vzdump).
+EOF
+}
+
+main() {
+  local -a orig=("$@")
+  local id name node type cli rc
+  pve_cli_parse "$@"
+  ((${#PVE_ARGS[@]} == 2)) || pve_usage_error "expected <vmid> <name>"
+  id="${PVE_ARGS[0]}"
+  name="${PVE_ARGS[1]}"
+  [[ "$id" != -* ]] || pve_usage_error "unknown option: $id"
+  [[ "$name" != -* ]] || pve_usage_error "unknown option: $name"
+  [[ "$id" =~ ^[0-9]{1,9}$ ]] || pve_usage_error "invalid VMID: $id"
+  [[ "$name" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}$ ]] || pve_usage_error "invalid snapshot name: $name"
+  [[ "$name" != @(current|pending|vzdump) ]] || pve_usage_error "reserved snapshot name: $name"
+  ((${#name} >= 2)) || pve_usage_error "snapshot name needs at least 2 characters: $name"
+  pve_init pve-snapshot "${orig[@]}"
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  type="$PVE_GUEST_TYPE"
+  cli="$(pve_cli_of "$type")"
+  pve_check_ok "$type $id is on $node"
+  rc=0
+  pve_guest_has_snapshot "$node" "$type" "$id" "$name" || rc=$?
+  ((rc != 2)) || pve_check_fail "cannot read the snapshots of $type $id"
+  ((rc != 0)) || pve_check_fail "$type $id already has a snapshot named $name"
+  pve_check_ok "snapshot name $name is unused"
+  pve_require_snapshot_capable "$node" "$type" "$id"
+  pve_plan_reset
+  pve_hint target "$type $id on $node"
+  pve_hint path trivial
+  pve_hint rollback "$cli rollback $id $name; remove it later with $cli delsnapshot $id $name"
+  pve_hint baseline/after "bin/pve-state $id"
+  pve_plan_add "$node" "$cli" snapshot "$id" "$name"
+  pve_plan_execute "Take snapshot $name of $type $id on $node?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  rc=0
+  pve_guest_has_snapshot "$node" "$type" "$id" "$name" || rc=$?
+  ((rc != 2)) || pve_verify_fail "cannot read the snapshots of $type $id after the command"
+  ((rc == 0)) || pve_verify_fail "snapshot $name is not listed after the command"
+  pve_verify_ok "snapshot $name is listed"
+}
+
+main "$@"

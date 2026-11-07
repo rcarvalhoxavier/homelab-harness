@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# pve-collect-install: install the forced-command dispatcher and its lists on one node (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-collect-install <node> [--dry-run] [--yes]
+
+Installs remote/homelab-collect as /usr/local/bin/homelab-collect and the allowlists as
+/etc/homelab-collect/framework.allow and local.allow (from local/collect.allow, or empty), then
+checks that the dispatcher reports this repo's version. It never edits authorized_keys: it
+prints the line to add by hand. Run it again after every upstream merge that changes remote/.
+EOF
+}
+
+main() {
+  local -a orig=("$@")
+  local node local_list digest out
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]+"${PVE_ARGS[@]}"}"
+  PVE_ARGS=()
+  while (($# > 0)); do
+    case "$1" in
+      -*) pve_usage_error "unknown option: $1" ;;
+      *) PVE_ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#PVE_ARGS[@]} == 1)) || pve_usage_error "expected one node"
+  node="${PVE_ARGS[0]}"
+  pve_init pve-collect-install "${orig[@]}"
+  pve_target_node "$node"
+  pve_reachable "$node" || pve_check_fail "$node is unreachable through its collect alias"
+  pve_check_ok "$node is reachable"
+  out="$(bash "$PVE_ROOT/remote/homelab-collect" --check "$PVE_ROOT/remote/collect.allow" 2>&1)" ||
+    pve_check_fail "remote/collect.allow is invalid: $out"
+  pve_check_ok "remote/collect.allow is valid"
+  local_list="$PVE_ROOT/local/collect.allow"
+  if [[ -f "$local_list" ]]; then
+    out="$(bash "$PVE_ROOT/remote/homelab-collect" --check "$local_list" 2>&1)" ||
+      pve_check_fail "local/collect.allow is invalid: $out"
+    pve_check_ok "local/collect.allow is valid"
+  else
+    pve_check_warn "local/collect.allow is absent: local.allow on $node will be replaced by an empty list"
+    local_list="$(mktemp)"
+    pve_cleanup_add "$local_list"
+  fi
+  digest="$(pve_collect_hash)"
+  [[ "$digest" =~ ^[0-9a-f]{16}$ ]] || pve_check_fail "cannot compute the version hash of the dispatcher files"
+  _pve_alias_of "$node" collect
+  pve_plan_reset
+  pve_hint target "node $node"
+  pve_hint path standard
+  pve_hint rollback "first install: remove /usr/local/bin/homelab-collect and the lists in /etc/homelab-collect (keep use-sudo); re-install: run this tool again from the previous commit; never remove the dispatcher while an authorized_keys line forces it"
+  pve_hint baseline/after "ssh $REPLY homelab-collect --version"
+  pve_plan_add "$node" install -d -o root -g root -m 0755 /etc/homelab-collect
+  pve_plan_put "$node" "$PVE_ROOT/remote/homelab-collect" /usr/local/bin/homelab-collect 0755 summary
+  pve_plan_put "$node" "$PVE_ROOT/remote/collect.allow" /etc/homelab-collect/framework.allow 0644
+  pve_plan_put "$node" "$local_list" /etc/homelab-collect/local.allow 0644
+  pve_plan_execute "Install the dispatcher on $node?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  out="$(pve_collect "$node" homelab-collect --version)" || pve_verify_fail "the dispatcher does not answer on $node"
+  if [[ "$out" == "homelab-collect $digest" ]]; then
+    pve_verify_ok "the dispatcher answers $digest"
+  else
+    pve_verify_fail "the dispatcher answers '$out', expected homelab-collect $digest"
+  fi
+  _pve_alias_of "$node" collect
+  cat <<EOF
+next, by hand: in the authorized_keys of the account that '$REPLY' logs into, prefix the agent
+key's line with
+  command="/usr/local/bin/homelab-collect",restrict
+then check with: bin/pve-selftest --node $node
+On a cluster, root's authorized_keys is shared by every node: install the dispatcher on all of
+them before adding the prefix.
+EOF
+}
+
+main "$@"

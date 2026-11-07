@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# pve-backup: an on-demand vzdump of one guest before a change (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-backup <vmid> [--node NODE] [--storage STORAGE] [--dry-run] [--yes]
+
+An on-demand backup of one guest (vzdump, snapshot mode, zstd) to STORAGE, by default
+PVE_BACKUP_STORAGE. No retention or pruning: the scheduled backup job keeps that role.
+Checks that the storage is active and accepts backups; verifies that a new archive appeared.
+A backup is a rollback only once it is proved restorable.
+EOF
+}
+
+main() {
+  local -a orig=("$@")
+  local id="" storage="" node type cli line state content config status key vstorage pct before after new
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --storage)
+        (($# >= 2)) || pve_usage_error "--storage needs a value"
+        storage="$2"
+        shift 2
+        ;;
+      -*) pve_usage_error "unknown option: $1" ;;
+      *)
+        [[ -z "$id" ]] || pve_usage_error "expected one VMID"
+        id="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ "$id" =~ ^[0-9]{1,9}$ ]] || pve_usage_error "expected a VMID"
+  pve_init pve-backup "${orig[@]}"
+  storage="${storage:-$PVE_BACKUP_STORAGE}"
+  [[ -n "$storage" ]] || pve_usage_error "no backup storage: pass --storage or set PVE_BACKUP_STORAGE"
+  [[ "$storage" =~ ^[A-Za-z][A-Za-z0-9_.-]{0,63}$ ]] || pve_usage_error "invalid storage name: $storage"
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  type="$PVE_GUEST_TYPE"
+  cli="$(pve_cli_of "$type")"
+  pve_check_ok "$type $id is on $node"
+  line="$(pve_storage_line "$node" "$storage")" || pve_check_fail "storage $storage is not configured on $node"
+  read -r _ _ state _ <<< "$line"
+  [[ "$state" == active ]] || pve_check_fail "storage $storage is $state on $node"
+  pve_check_ok "storage $storage is active on $node"
+  content="$(pve_storage_content "$node" "$storage")" || pve_check_fail "storage $storage is not in storage.cfg"
+  [[ ",$content," == *,backup,* ]] || pve_check_fail "storage $storage does not accept backups (content: $content)"
+  pve_check_ok "storage $storage accepts backups"
+  config="$(pve_collect "$node" "$cli" config "$id")" || pve_check_fail "cannot read the config of $type $id"
+  status="$(pve_collect "$node" pvesm status)" || pve_check_fail "cannot read pvesm status on $node"
+  while read -r key vstorage _ _; do
+    [[ -n "$key" && "$key" != unused* ]] || continue
+    pct="$(pve_parse_pvesm_status <<< "$status" | awk -v s="$vstorage" '$1 == s { print $7 }')"
+    if [[ -n "$pct" && "$pct" != - ]] && pve_num_gt "$pct" 90; then
+      pve_check_warn "$vstorage, which holds $key, is at $pct%: the snapshot-mode backup may fail"
+    fi
+  done < <(pve_parse_config_volumes <<< "$config")
+  before="$(pve_guest_backups "$node" "$storage" "$id")" || pve_check_fail "cannot list the backups on $storage"
+  pve_plan_reset
+  pve_hint target "$type $id on $node"
+  pve_hint path trivial
+  pve_hint rollback "nothing to undo: the archive is new; prove it restorable before relying on it"
+  pve_hint baseline/after "bin/pve-state $id"
+  pve_plan_add "$node" vzdump "$id" --mode snapshot --compress zstd --storage "$storage" \
+    --notes-template "pre-change {{guestname}}"
+  pve_plan_execute "Back up $type $id on $node to $storage?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  after="$(pve_guest_backups "$node" "$storage" "$id")" || pve_verify_fail "cannot list the backups on $storage"
+  new="$(LC_ALL=C comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tail -n 1)"
+  if [[ -n "$new" ]]; then
+    pve_verify_ok "new backup ${new#* }"
+  else
+    pve_verify_fail "no new backup of $type $id on $storage"
+  fi
+}
+
+main "$@"

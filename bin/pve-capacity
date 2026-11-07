@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+# pve-capacity: structural capacity report with prioritized recommendations (read-only).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF2'
+Usage: pve-capacity [--node NODE] [--quiet]
+
+Volume-group free space and thin pools, ZFS pools, guest disks per storage (largest first),
+orphaned volumes, storage.cfg against reality, and quorum, followed by recommendations.
+Orphan detection covers LVM volumes and guest volumes that no config references; ZFS datasets
+are not checked.
+
+A read that fails on a node that answered is a CRIT ("could not read ... on <node>"), never an
+empty or plausible section.
+
+Exit 0 without CRIT, 1 with a CRIT or an unreachable node, 2 on a usage or configuration error.
+Read-only: uses the collect alias only.
+EOF2
+}
+
+CRIT=0
+UNREACHABLE=0
+RECS=()
+REFS_COMPLETE=1
+ERRFILE=""
+STATUS_OK=0
+GUESTS_COMPLETE=1
+MEMBERS_MISSING=""
+MEMBERS_UNKNOWN=""
+UNKNOWN_OF=()
+CONFIGS_UNREAD=()
+declare -A LISTED=() MISSING=() REACHABLE=()
+declare -A REFERENCED=() REF_VOLUME=() GUEST_AT=() VG_FREE=() GUESTS_OF=() GUESTS_OK=() VOLS=() VOLS_OK=() SNAPS=() SNAPS_OK=()
+LVS_POOLS=(lvs --noheadings --units b --nosuffix -o "vg_name,lv_name,lv_size,data_percent,metadata_percent"
+           --select segtype=thin-pool)
+LVS_ALL=(lvs --noheadings --units b --nosuffix -o "lv_name,vg_name,lv_size,data_percent")
+VGS=(vgs --noheadings --units b --nosuffix -o "vg_name,vg_free")
+
+rec() {
+  RECS+=("$1|$2|$3")
+}
+
+unread() {
+  printf '  (could not read %s on %s)\n' "$1" "$PVE_READ_NODE"
+  CRIT=$((CRIT + 1))
+}
+
+# A failed read after the node answered is a CRIT line (lib/pve/pve.sh: pve_must_read).
+pve_read_failed() {
+  unread "$1"
+}
+
+# read_members NODE: the members of NODE's cluster (pvecm nodes), once per cluster. A member that
+# inventory/nodes does not list runs guests this report cannot see, while a shared storage lists
+# their disks: the orphan check then has no complete reference set. A standalone node has no other
+# member; a node whose members cannot be read goes to UNKNOWN_OF (stderr stays in ERRFILE: the
+# quorum section reports the failure of the node it covers).
+read_members() {
+  local node="$1" member
+  [[ -z "${LISTED[$node]:-}" ]] || return 0
+  pve_quorum "$node" 2> "$ERRFILE"
+  case "$PVE_QUORUM_STATE" in
+    standalone) return 0 ;;
+    cluster)
+      if pve_quorum_members "$node" 2> "$ERRFILE"; then
+        for member in $PVE_QUORUM_MEMBERS; do
+          LISTED[$member]=1
+          pve_node_known "$member" || MISSING[$member]=1
+        done
+        return 0
+      fi
+      ;;
+  esac
+  UNKNOWN_OF+=("$node")
+}
+
+# Every guest list and every volume any guest config references, on every reachable node (shared
+# storages list other nodes' disks). A failed read marks the reference set incomplete.
+collect_references() {
+  local node guests vmid gtype storage volume line key
+  for node in "${PVE_NODE_LIST[@]}"; do
+    PVE_READ_NODE="$node"
+    # probed once per run: the report below reuses the answer (and ssh's reason is printed once)
+    if ! pve_reachable "$node"; then
+      REFS_COMPLETE=0
+      GUESTS_COMPLETE=0
+      continue
+    fi
+    REACHABLE[$node]=1
+    read_members "$node"
+    if ! guests="$(pve_guests "$node" 2> "$ERRFILE")"; then
+      cat "$ERRFILE" >&2
+      REFS_COMPLETE=0
+      GUESTS_COMPLETE=0
+      continue
+    fi
+    GUESTS_OF[$node]="$guests"
+    GUESTS_OK[$node]=1
+    while read -r vmid gtype _; do
+      [[ -n "$vmid" ]] || continue
+      if [[ -z "${GUEST_AT[$vmid]:-}" ]]; then
+        GUEST_AT[$vmid]="$node $gtype"
+      fi
+      if ! pve_read "$(pve_cli_of "$gtype")" config "$vmid" || [[ -z "$PVE_READ_OUT" ]]; then
+        pve_read_replay
+        REFS_COMPLETE=0
+        CRIT=$((CRIT + 1))
+        CONFIGS_UNREAD+=("the config of $gtype $vmid on $node")
+        log_error "could not read the config of $gtype $vmid on $node"
+        continue
+      fi
+      while read -r _ storage volume _; do
+        if [[ -n "$storage" ]]; then
+          REFERENCED["$storage:$volume"]=1
+          REF_VOLUME["$volume"]=1
+        fi
+      done < <(pve_parse_config_volumes <<< "$PVE_READ_OUT")
+      # live volumes the parser does not report: vmstate (RAM of a snapshot) and a cloud-init
+      # drive (media=cdrom that is not an ISO)
+      while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*([a-z0-9]+):[[:space:]]*([^,[:space:]]+)(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        volume="${BASH_REMATCH[2]}"
+        if [[ "$key" == vmstate || "${BASH_REMATCH[3]}" == *media=cdrom* ]]; then
+          if [[ "$volume" == *:* && "$volume" != *:iso/* ]]; then
+            REFERENCED["$volume"]=1
+            REF_VOLUME["${volume#*:}"]=1
+          fi
+        fi
+      done <<< "$PVE_READ_OUT"
+    done <<< "$guests"
+  done
+  # a node another member's list names belongs to a cluster whose members are known
+  for node in "${UNKNOWN_OF[@]}"; do
+    if [[ -z "${LISTED[$node]:-}" ]]; then
+      MEMBERS_UNKNOWN="${MEMBERS_UNKNOWN:+$MEMBERS_UNKNOWN, }$node"
+    fi
+  done
+  if ((${#MISSING[@]} > 0)); then
+    MEMBERS_MISSING="$(printf '%s\n' "${!MISSING[@]}" | LC_ALL=C sort | paste -sd',' - | sed 's/,/, /g')"
+  fi
+}
+
+report_pools() {
+  local node="$1" status="$2" vg lv size data meta free name cap health text rc=0
+  if pve_must_read "volume groups" "${VGS[@]}"; then
+    while read -r vg free; do
+      [[ -n "$vg" ]] || continue
+      VG_FREE[$vg]="$(pve_gib "$free")"
+      printf 'vg %s: %s GiB free\n' "$vg" "${VG_FREE[$vg]}"
+    done < <(pve_parse_vgs <<< "$PVE_READ_OUT")
+  fi
+  if pve_must_read "thin pools" "${LVS_POOLS[@]}"; then
+    while read -r vg lv size data meta; do
+      [[ -n "$vg" ]] || continue
+      if [[ ! "$data" =~ ^[0-9.]+$ ]]; then
+        printf 'thin pool %s/%s: %s GiB, inactive (usage not reported)\n' "$vg" "$lv" "$(pve_gib "$size")"
+        CRIT=$((CRIT + 1))
+        rec thin-pool "$node" "thin pool $vg/$lv is inactive, so its usage is unknown: activate it with lvchange -ay $vg/$lv and run this report again"
+        continue
+      fi
+      printf 'thin pool %s/%s: %s GiB, data %s%%, metadata %s%%\n' "$vg" "$lv" "$(pve_gib "$size")" "$data" "$meta"
+      if pve_num_gt "$data" "$PVE_STORAGE_WARN_PCT"; then
+        CRIT=$((CRIT + 1))
+        text="thin pool $vg/$lv at $data% (limit $PVE_STORAGE_WARN_PCT%): extend it into the ${VG_FREE[$vg]:-unknown} GiB free in VG $vg (reversible, moves no data), move a disk with bin/pve-move-disk <vmid> <storage>, or remove the orphaned volumes listed under orphans"
+        if pve_num_gt "$data" 95; then
+          text+="; above 95% snapshots and moves may fail: stop non-essential guests first"
+        fi
+        rec thin-pool "$node" "$text"
+      fi
+    done < <(pve_parse_lvs_thinpools <<< "$PVE_READ_OUT")
+  fi
+  pve_zpool_read "$status" || rc=$?
+  if ((rc == 0)); then
+    while read -r name size _ _ cap health; do
+      [[ -n "$name" ]] || continue
+      printf 'zpool %s: %s GiB, %s%% used, %s\n' "$name" "$(pve_gib "$size")" "$cap" "$health"
+      if [[ "$health" != ONLINE ]]; then
+        CRIT=$((CRIT + 1))
+        rec zpool "$node" "zpool $name is $health: run zpool status on $node"
+      fi
+      if [[ "$cap" =~ ^[0-9.]+$ ]] && pve_num_gt "$cap" "$PVE_STORAGE_WARN_PCT"; then
+        CRIT=$((CRIT + 1))
+        rec zpool "$node" "zpool $name at $cap% (limit $PVE_STORAGE_WARN_PCT%)"
+      fi
+    done < <(pve_parse_zpool <<< "$PVE_READ_OUT")
+  fi
+}
+
+# Volumes of every active storage, read once per node into VOLS (raw pvesm list text).
+read_volumes() {
+  local name state
+  while read -r name _ state _; do
+    [[ "$state" == active ]] || continue
+    if pve_must_read "volumes of storage $name" pvesm list "$name"; then
+      VOLS[$name]="$PVE_READ_OUT"
+      VOLS_OK[$name]=1
+    fi
+  done < <(pve_parse_pvesm_status <<< "$1")
+}
+
+report_disks() {
+  local status="$1" guests="$2" name type state pct volid vtype size vmid gname
+  local -A names=()
+  while read -r vmid _ _ gname; do
+    if [[ -n "$vmid" ]]; then
+      names[$vmid]="$gname"
+    fi
+  done <<< "$guests"
+  printf 'disks by storage:\n'
+  if ((STATUS_OK == 0)); then
+    return 0
+  fi
+  while read -r name type state _ _ _ pct; do
+    [[ -n "$name" ]] || continue
+    if [[ "$state" != active ]]; then
+      printf '  %s (%s): %s, usage not reported\n' "$name" "$type" "$state"
+      continue
+    fi
+    printf '  %s (%s): %s%% used\n' "$name" "$type" "$pct"
+    [[ -n "${VOLS_OK[$name]:-}" ]] || continue
+    while read -r volid _ vtype size vmid; do
+      if [[ "$vtype" == images || "$vtype" == rootdir ]]; then
+        printf '    %8s GiB  %s  %s\n' "$(pve_gib "$size")" "$volid" "${names[$vmid]:-(no guest on this node)}"
+      fi
+    done < <(pve_parse_pvesm_list <<< "${VOLS[$name]}" | LC_ALL=C sort -k4,4nr -k1,1)
+  done < <(pve_parse_pvesm_status <<< "$status")
+}
+
+# snap_listed NODE TYPE VMID NAME: 0 Proxmox lists it, 1 it does not, 2 the list could not be read.
+# NODE is the guest's node (on shared LVM another node's guest has volumes here).
+snap_listed() {
+  local key="$1 $2 $3" here="$PVE_READ_NODE"
+  if [[ -z "${SNAPS_OK[$key]:-}" ]]; then
+    PVE_READ_NODE="$1"
+    if pve_must_read "snapshots of $2 $3" "$(pve_cli_of "$2")" listsnapshot "$3"; then
+      # a real listing always has a "current" line; anything else is a broken read
+      if grep -q 'current' <<< "$PVE_READ_OUT"; then
+        SNAPS[$key]="$(pve_parse_snapshots <<< "$PVE_READ_OUT")"
+        SNAPS_OK[$key]=1
+      else
+        unread "snapshots of $2 $3"
+        SNAPS_OK[$key]=0
+      fi
+    else
+      SNAPS_OK[$key]=0
+    fi
+    PVE_READ_NODE="$here"
+  fi
+  [[ "${SNAPS_OK[$key]}" == 1 ]] || return 2
+  awk -v want="$4" '$1 == want { found = 1 } END { exit !found }' <<< "${SNAPS[$key]}"
+}
+
+orphan() {
+  printf '  %s\n' "$2"
+  found=1
+  rec orphan "$1" "$2"
+}
+
+# volume_owner NAME: set OWNER to "node type" of the guest whose VMID the volume name carries
+# (vm-<id>-..., base-<id>-..., subvol-<id>-..., after any directory); fail when no readable node has it.
+volume_owner() {
+  OWNER=""
+  [[ "${1##*/}" =~ ^(vm|base|subvol)-([0-9]+)- ]] || return 1
+  OWNER_ID="${BASH_REMATCH[2]}"
+  OWNER="${GUEST_AT[$OWNER_ID]:-}"
+  [[ -n "$OWNER" ]]
+}
+
+# not_current WHAT: a volume of an existing guest that its current config does not name. Real
+# pct/qm config prints the current config only, so a snapshot's disk or vmstate lands here: never
+# an orphan, never a removal recommendation.
+not_current() {
+  printf '  %s: not in the current config of %s %s (may belong to a snapshot)\n' "$1" "${OWNER#* }" "$OWNER_ID"
+  found=1
+}
+
+report_orphans() {
+  local node="$1" found=0 skipped=0 lv vg size id snap name state volid vtype rc text
+  local snap_re='^snap_vm-([0-9]+)-disk-[0-9]+_(.+)$' disk_re='^vm-([0-9]+)-disk-[0-9]+$'
+  local -A reported=()
+  printf 'orphans:\n'
+  if [[ -z "${GUESTS_OK[$node]:-}" ]]; then
+    unread guests
+    printf '  (orphan check skipped: guests unreadable)\n'
+    return 0
+  fi
+  if [[ "$MEMBERS_MISSING" == *,* ]]; then
+    printf '  (orphan check skipped: cluster members %s are not in inventory/nodes)\n' "$MEMBERS_MISSING"
+    return 0
+  elif [[ -n "$MEMBERS_MISSING" ]]; then
+    printf '  (orphan check skipped: cluster member %s is not in inventory/nodes)\n' "$MEMBERS_MISSING"
+    return 0
+  elif [[ -n "$MEMBERS_UNKNOWN" ]]; then
+    printf '  (orphan check skipped: the cluster members of %s could not be read)\n' "$MEMBERS_UNKNOWN"
+    return 0
+  fi
+  if pve_must_read "logical volumes" "${LVS_ALL[@]}"; then
+    while read -r lv vg size _; do
+      text="lv $vg/$lv $(pve_gib "$size") GiB"
+      if [[ "$lv" =~ $snap_re ]]; then
+        id="${BASH_REMATCH[1]}"
+        snap="${BASH_REMATCH[2]}"
+        if [[ -n "${GUEST_AT[$id]:-}" ]]; then
+          rc=0
+          snap_listed "${GUEST_AT[$id]% *}" "${GUEST_AT[$id]#* }" "$id" "$snap" || rc=$?
+          if ((rc == 1)); then
+            orphan "$node" "$text: snapshot that Proxmox does not list"
+          fi
+        elif ((GUESTS_COMPLETE == 1)); then
+          orphan "$node" "$text: snapshot of a guest that is on no node"
+        else
+          printf '  (%s not checked: guest %s is on no readable node, and not every node could be read)\n' "$text" "$id"
+          skipped=1
+        fi
+      elif [[ "$lv" =~ $disk_re ]]; then
+        id="${BASH_REMATCH[1]}"
+        reported[$lv]=1
+        if volume_owner "$lv"; then
+          if [[ -z "${REF_VOLUME[$lv]:-}" ]] && ((REFS_COMPLETE == 1)); then
+            not_current "$text"
+          fi
+        elif ((GUESTS_COMPLETE == 1)); then
+          orphan "$node" "$text: disk of a guest that is on no node"
+        else
+          printf '  (%s not checked: guest %s is on no readable node, and not every node could be read)\n' "$text" "$id"
+          skipped=1
+        fi
+      fi
+    done < <(pve_parse_lvs <<< "$PVE_READ_OUT")
+  else
+    skipped=1
+  fi
+  if ((REFS_COMPLETE == 0)); then
+    # the CRIT of each config was counted once, in collect_references
+    for text in "${CONFIGS_UNREAD[@]}"; do
+      printf '  (could not read %s)\n' "$text"
+    done
+    printf '  (unreferenced-volume check skipped: not every guest config could be read)\n'
+    skipped=1
+  elif ((STATUS_OK == 0)); then
+    printf '  (unreferenced-volume check skipped: storage status unreadable)\n'
+    skipped=1
+  else
+    while read -r name _ state _; do
+      [[ "$state" == active ]] || continue
+      if [[ -z "${VOLS_OK[$name]:-}" ]]; then
+        printf '  (volumes of storage %s not checked: unreadable)\n' "$name"
+        skipped=1
+        continue
+      fi
+      while read -r volid _ vtype size _; do
+        [[ "$vtype" == images || "$vtype" == rootdir ]] || continue
+        [[ -z "${REFERENCED[$volid]:-}" && -z "${reported[${volid#*:}]:-}" ]] || continue
+        if volume_owner "${volid#*:}"; then
+          not_current "volume $volid $(pve_gib "$size") GiB"
+        else
+          orphan "$node" "volume $volid $(pve_gib "$size") GiB: no guest config references it"
+        fi
+      done < <(pve_parse_pvesm_list <<< "${VOLS[$name]}")
+    done < <(pve_parse_pvesm_status <<< "$2")
+  fi
+  # "(none)" only when every check ran: after a skipped one it would read as "no orphans"
+  if ((found == 0 && skipped == 0)); then
+    printf '  (none)\n'
+  fi
+}
+
+report_storage_cfg() {
+  local node="$1" status="$2" cfg member name type nodes shared vg st problems=0 members_ok=1
+  local -a listed
+  local -A members=() vgs=() state=()
+  printf 'storage.cfg:\n'
+  if ! pve_must_read "storage.cfg" cat /etc/pve/storage.cfg; then
+    return 0
+  fi
+  cfg="$PVE_READ_OUT"
+  if [[ -z "$(pve_parse_storage_cfg <<< "$cfg")" ]]; then
+    unread "storage.cfg"
+    return 0
+  fi
+  # members: pvecm nodes on a cluster, /etc/pve/nodes on a standalone node (its real Proxmox name,
+  # which inventory/nodes may not use); an unreadable quorum is reported under quorum
+  if [[ "$PVE_QUORUM_STATE" == unreadable ]]; then
+    members_ok=0
+  elif pve_quorum_members "$node"; then
+    for member in $PVE_QUORUM_MEMBERS; do
+      members[$member]=1
+    done
+  else
+    unread "cluster members"
+    members_ok=0
+  fi
+  if ((members_ok == 0)); then
+    printf '  (ghost-node check skipped: cluster members unknown)\n'
+  fi
+  if pve_read "${VGS[@]}"; then
+    while read -r vg _; do
+      if [[ -n "$vg" ]]; then vgs[$vg]=1; fi
+    done < <(pve_parse_vgs <<< "$PVE_READ_OUT")
+  fi
+  while read -r name _ st _; do
+    if [[ -n "$name" ]]; then state[$name]="$st"; fi
+  done < <(pve_parse_pvesm_status <<< "$status")
+  while IFS='|' read -r name type nodes shared vg _; do
+    [[ -n "$name" ]] || continue
+    if ((STATUS_OK == 1)); then
+      st="${state[$name]:-absent}"
+    else
+      st=unknown
+    fi
+    printf '  %s (%s)%s, here: %s\n' "$name" "$type" "${nodes:+, limited to $nodes}" "$st"
+    if [[ -n "$nodes" ]] && ((members_ok == 1)); then
+      IFS=',' read -r -a listed <<< "$nodes"
+      for member in "${listed[@]}"; do
+        if [[ -z "${members[$member]:-}" ]]; then
+          printf '    ghost node: %s is not a cluster member\n' "$member"
+          problems=1
+          rec storage-cfg cluster "storage $name lists node $member, which is not a cluster member: remove it from nodes in storage.cfg"
+        fi
+      done
+    fi
+    if [[ "$st" == disabled && -n "$vg" ]]; then
+      if [[ -n "${vgs[$vg]:-}" ]]; then
+        printf '    disabled, but VG %s exists here: it can be re-enabled\n' "$vg"
+        rec storage-cfg "$node" "storage $name is disabled while VG $vg exists on $node: re-enable it if that is intended"
+      else
+        printf '    disabled, and VG %s does not exist here\n' "$vg"
+        problems=1
+      fi
+    fi
+    if [[ "$type" == dir && "$shared" == 1 ]]; then
+      printf '    shared 1 on a dir storage: Proxmox assumes the same content on every node\n'
+      problems=1
+      rec storage-cfg cluster "storage $name has shared 1 on a dir storage: correct only if the path is a network mount shared by all nodes; otherwise set shared 0"
+    fi
+  done < <(pve_parse_storage_cfg <<< "$cfg")
+  if ((problems == 0)); then
+    printf '  (no configuration problem found)\n'
+  fi
+}
+
+report_quorum() {
+  local expected total quorate ghosts="" member
+  local -A members=()
+  case "$PVE_QUORUM_STATE" in
+    standalone) printf 'quorum: standalone\n'; return 0 ;;
+    unreadable) unread quorum; return 0 ;;
+  esac
+  expected="$PVE_QUORUM_EXPECTED"
+  total="$PVE_QUORUM_TOTAL"
+  quorate="$PVE_QUORUM_QUORATE"
+  printf 'quorum: %s of %s votes, quorate %s\n' "$total" "$expected" "$quorate"
+  if [[ "$quorate" != Yes ]]; then
+    CRIT=$((CRIT + 1))
+    rec quorum cluster "the cluster is not quorate: $total of $expected votes"
+  fi
+  if [[ "$expected" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] && ((expected > total)); then
+    if pve_must_read "cluster members" pvecm nodes; then
+      while read -r member; do
+        if [[ -n "$member" ]]; then members[$member]=1; fi
+      done < <(pve_parse_pvecm_nodes <<< "$PVE_READ_OUT")
+      if pve_must_read "registered nodes" ls /etc/pve/nodes; then
+        while read -r member; do
+          if [[ -n "$member" && -z "${members[$member]:-}" ]]; then
+            ghosts="${ghosts:+$ghosts, }$member"
+          fi
+        done < <(LC_ALL=C sort <<< "$PVE_READ_OUT")
+      fi
+    fi
+    printf '  ghost vote: %s votes expected, %s present%s\n' "$expected" "$total" \
+      "${ghosts:+; registered but not members: $ghosts}"
+    rec quorum cluster "the cluster expects $expected votes and $total are present${ghosts:+; registered but not members: $ghosts (remove with pvecm delnode)}"
+  fi
+  if [[ "$total" == 2 ]]; then
+    # pve_quorum read /etc/pve/corosync.conf already
+    if grep -Eq '^[[:space:]]*two_node:[[:space:]]*1' <<< "$PVE_QUORUM_COROSYNC"; then
+      printf '  two_node: 1 is set: each node keeps quorum alone; the risk left is a split brain if the link between the nodes fails while both run\n'
+      rec quorum cluster "two_node is set: quorum survives one node at the cost of a split-brain risk; a QDevice on an independent machine is the durable fix"
+    else
+      printf '  two votes without two_node: losing one node loses quorum and makes /etc/pve read-only\n'
+      rec quorum cluster "only two votes: evaluate a QDevice on an independent machine, or two_node: 1"
+    fi
+  fi
+}
+
+report_recommendations() {
+  local kind entry rkind node text n=0
+  local -A seen=()
+  printf '== recommendations\n'
+  for kind in thin-pool zpool orphan storage-cfg quorum; do
+    for entry in "${RECS[@]}"; do
+      IFS='|' read -r rkind node text <<< "$entry"
+      [[ "$rkind" == "$kind" && -z "${seen[$node|$text]:-}" ]] || continue
+      seen["$node|$text"]=1
+      n=$((n + 1))
+      printf '%d. [%s] %s\n' "$n" "$node" "$text"
+    done
+  done
+  if ((n == 0)); then
+    printf '(no action recommended)\n'
+  fi
+}
+
+main() {
+  local -a orig=("$@")
+  local only="" node status guests
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      *) pve_usage_error "unknown argument: $1" ;;
+    esac
+  done
+  pve_init pve-capacity "${orig[@]}"
+  only="$PVE_NODE_OPT"
+  ERRFILE="$(mktemp)"
+  pve_cleanup_add "$ERRFILE"
+  collect_references
+  printf 'pve-capacity 1\n'
+  for node in "${PVE_NODE_LIST[@]}"; do
+    [[ -z "$only" || "$node" == "$only" ]] || continue
+    PVE_READ_NODE="$node"
+    printf '== node %s\n' "$node"
+    if [[ -z "${REACHABLE[$node]:-}" ]]; then
+      printf 'UNREACHABLE\n'
+      UNREACHABLE=$((UNREACHABLE + 1))
+      continue
+    fi
+    VG_FREE=()
+    VOLS=()
+    VOLS_OK=()
+    SNAPS=()
+    SNAPS_OK=()
+    STATUS_OK=0
+    status=""
+    if pve_must_read storage pvesm status; then
+      status="$PVE_READ_OUT"
+      if [[ -z "$(pve_parse_pvesm_status <<< "$status")" ]]; then
+        unread storage
+      else
+        STATUS_OK=1
+        read_volumes "$status"
+      fi
+    fi
+    guests="${GUESTS_OF[$node]:-}"
+    report_pools "$node" "$status"
+    report_disks "$status" "$guests"
+    report_orphans "$node" "$status"
+    pve_quorum "$node"
+    report_storage_cfg "$node" "$status"
+    report_quorum
+  done
+  report_recommendations
+  if ((CRIT > 0 || UNREACHABLE > 0)); then
+    exit 1
+  fi
+}
+
+main "$@"

@@ -1,0 +1,6 @@
+nfs: nas-backup
+	export /mnt/tank/proxmox-backups
+	path /mnt/pve/nas-backup
+	server 10.0.0.30
+	content backup
+	prune-backups keep-all=1

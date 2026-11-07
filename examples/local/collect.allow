@@ -1,0 +1,4 @@
+# Example local allowlist (local/collect.allow in a real installation): reads inside guests that
+# only this homelab needs. Same grammar as remote/collect.allow; whole commands only.
+pct exec 101 -- pihole -v
+pct exec 101 -- pihole status

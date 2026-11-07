@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Fake scp for the toolkit tests: records each copy with its destination and content."""
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main():
+    scenario = json.loads(Path(os.environ["FAKE_SSH_SCENARIO"]).read_text())
+    args, files, i = sys.argv[1:], [], 0
+    while i < len(args):
+        if args[i] == "--":
+            files.extend(args[i + 1:])
+            break
+        if args[i] == "-o":
+            i += 2
+            continue
+        if args[i].startswith("-"):
+            i += 1
+            continue
+        files.append(args[i])
+        i += 1
+    source, dest = files[0], files[1]
+    alias, _, path = dest.partition(":")
+    info = scenario["aliases"].get(alias, {"role": "unknown"})
+    record = {"tool": "scp", "alias": alias, "role": info["role"], "node": info.get("node"),
+              "path": path, "content": Path(source).read_text(encoding="utf-8"),
+              "options": args, "sshpass": "SSHPASS" in os.environ}
+    with open(scenario["log"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+    if info["role"] in ("unknown", "unreachable"):
+        sys.stderr.write(f"ssh: connect to host {alias} port 22: No route to host\n")
+        sys.exit(255)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

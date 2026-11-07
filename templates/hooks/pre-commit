@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Installed by `bin/init --hooks`. Blocks a commit that stages secrets under wiki/ or
+# local/ (and, in an `exposure: public` wiki, IP/MAC addresses and home hostnames). It
+# scans the staged copy (the index, not the working tree) of every added, copied,
+# modified or renamed file.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if [ ! -x bin/wiki-lint ]; then
+  echo "wiki pre-commit: bin/wiki-lint not found in $root; skipping the secret scan" >&2
+  exit 0
+fi
+
+staged="$(mktemp -d)"
+trap 'rm -rf "$staged"' EXIT
+
+# -z keeps unusual file names intact; --no-renames reports a renamed file as added,
+# so its content is scanned like any other.
+git diff --cached --name-only -z --no-renames --diff-filter=ACM -- wiki/ local/ \
+  | git checkout-index -z --stdin --prefix="$staged/"
+
+files=()
+for dir in "$staged/wiki" "$staged/local"; do
+  [ -d "$dir" ] || continue
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find "$dir" -type f -print0)
+done
+
+if [ "${#files[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+# The exceptions that count are the staged ones: the commit must carry its own review.
+allow="$staged.allow"
+trap 'rm -rf "$staged" "$allow"' EXIT
+git show :wiki/.secret-scan-allow > "$allow" 2>/dev/null || : > "$allow"
+
+status=0
+bin/wiki-lint --only secrets --allow-file "$allow" --paths-root "$staged" --paths "${files[@]}" \
+  | sed "s#$staged/##" || status=$?
+exit "$status"

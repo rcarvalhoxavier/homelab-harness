@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# homelab-collect: the only command the agent's read-only SSH key may run on this host.
+#
+#   authorized_keys: command="/usr/local/bin/homelab-collect",restrict ssh-ed25519 AAAA... agent
+#
+# A command runs only when it matches a line of /etc/homelab-collect/framework.allow or
+# local.allow token by token (grammar: docs/proxmox-toolkit.md). Options for local use only;
+# sshd passes the client's command solely in SSH_ORIGINAL_COMMAND, never as arguments:
+#   --etc DIR         read the lists from DIR
+#   --check FILE      validate the grammar of a list
+#   --match COMMAND   print "allowed" or "refused" without running anything
+#   --version         print the hash of this script and the installed lists
+set -uo pipefail
+# Fixed locale and PATH before any matching: bash ERE ranges follow the inherited locale.
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ETC=/etc/homelab-collect
+SELF="${BASH_SOURCE[0]}"
+LOCAL_RUN=0
+ARG_RE='^[A-Za-z0-9_./:=,@+-]+$'
+CMD_RE='^[A-Za-z0-9_./:=,@+ -]+$'
+RULE_RE='^[A-Za-z0-9_./:=,@+{} -]+$'
+FIELD_TOKEN_RE='^\{([a-z]+)\}$'
+SKIP_RE='^[[:space:]]*(#.*)?$'
+declare -A FIELD=(
+  [id]='^[0-9]{1,9}$'
+  [storage]='^[A-Za-z][A-Za-z0-9_.-]{0,63}$'
+  [node]='^[A-Za-z0-9][A-Za-z0-9.-]*$'
+  [snap]='^[A-Za-z][A-Za-z0-9_-]{0,39}$'
+  [aptfile]='^/etc/apt/sources\.list\.d/[A-Za-z0-9_.-]+\.(list|sources)$'
+)
+RULES=()
+LIST_ERROR=""
+
+audit() {
+  if ((LOCAL_RUN == 0)) && command -v logger >/dev/null 2>&1; then
+    logger -t homelab-collect -- "$1" || true
+  fi
+}
+
+# shown TEXT: TEXT for a log or an error line: printf %q (a newline cannot start a second line),
+# at most 512 bytes.
+shown() {
+  local quoted
+  printf -v quoted '%q' "$1"
+  printf '%s' "${quoted:0:512}"
+}
+
+# spacing_ok TEXT: not empty, no leading, trailing or double space.
+spacing_ok() {
+  [[ -n "$1" && "$1" != " "* && "$1" != *" " && "$1" != *"  "* ]]
+}
+
+# valid_rule LINE: every token is a literal in the argument charset or a known {field}. The program
+# name is always a literal: the first token, and the one after "pct exec <id> --".
+valid_rule() {
+  local token
+  local -a tokens
+  [[ "$1" =~ $RULE_RE ]] && spacing_ok "$1" || return 1
+  read -r -a tokens <<< "$1"
+  [[ ! "${tokens[0]}" =~ $FIELD_TOKEN_RE ]] || return 1
+  if [[ "${tokens[0]}" == pct && "${tokens[1]:-}" == exec && "${tokens[3]:-}" == -- ]]; then
+    [[ -n "${tokens[4]:-}" && ! "${tokens[4]}" =~ $FIELD_TOKEN_RE ]] || return 1
+  fi
+  for token in "${tokens[@]}"; do
+    if [[ "$token" =~ $FIELD_TOKEN_RE ]]; then
+      [[ -n "${FIELD[${BASH_REMATCH[1]}]+x}" ]] || return 1
+    else
+      [[ "$token" =~ $ARG_RE ]] || return 1
+    fi
+  done
+}
+
+# load_file FILE: append its rules; the first invalid line goes to LIST_ERROR (fail closed).
+load_file() {
+  local file="$1" line n=0
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ $SKIP_RE ]] && continue
+    if valid_rule "$line"; then
+      RULES+=("$line")
+    elif [[ -z "$LIST_ERROR" ]]; then
+      LIST_ERROR="invalid allowlist line: $file:$n"
+    fi
+  done < "$file"
+}
+
+# allowed COMMAND: 0 when the command matches a rule token by token.
+allowed() {
+  local cmd="$1" rule i want
+  local -a argv pattern
+  [[ -z "$LIST_ERROR" && "$cmd" =~ $CMD_RE ]] && spacing_ok "$cmd" || return 1
+  read -r -a argv <<< "$cmd"
+  for rule in "${RULES[@]}"; do
+    read -r -a pattern <<< "$rule"
+    ((${#pattern[@]} == ${#argv[@]})) || continue
+    for i in "${!pattern[@]}"; do
+      if [[ "${pattern[$i]}" =~ $FIELD_TOKEN_RE ]]; then
+        want="${FIELD[${BASH_REMATCH[1]}]}"
+        [[ "${argv[$i]}" =~ $want ]] || continue 2
+      elif [[ "${argv[$i]}" != "${pattern[$i]}" ]]; then
+        continue 2
+      fi
+    done
+    return 0
+  done
+  return 1
+}
+
+version() {
+  local sum
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum="$(cat "$SELF" "$ETC/framework.allow" "$ETC/local.allow" 2>/dev/null | sha256sum)"
+  else
+    sum="$(cat "$SELF" "$ETC/framework.allow" "$ETC/local.allow" 2>/dev/null | shasum -a 256)"
+  fi
+  printf 'homelab-collect %s\n' "${sum:0:16}"
+}
+
+main() {
+  local mode=run subject="" cmd
+  local -a argv
+  while (($# > 0)); do
+    case "$1" in
+      --etc|--check|--match)
+        if (($# < 2)); then
+          printf 'homelab-collect: %s needs a value\n' "$1" >&2
+          exit 2
+        fi
+        case "$1" in
+          --etc) ETC="$2" ;;
+          --check) mode=check; subject="$2" ;;
+          --match) mode=match; subject="$2" ;;
+        esac
+        LOCAL_RUN=1
+        shift 2
+        ;;
+      --version) mode=version; shift ;;
+      *) printf 'homelab-collect: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+  done
+  if [[ "$mode" == check ]]; then
+    load_file "$subject"
+    if [[ -n "$LIST_ERROR" ]]; then
+      printf 'homelab-collect: %s\n' "$LIST_ERROR" >&2
+      exit 1
+    fi
+    printf '%s: %d rules\n' "$subject" "${#RULES[@]}"
+    exit 0
+  fi
+  if [[ "$mode" == version ]]; then
+    version
+    exit 0
+  fi
+  load_file "$ETC/framework.allow"
+  load_file "$ETC/local.allow"
+  if [[ "$mode" == match ]]; then cmd="$subject"; else cmd="${SSH_ORIGINAL_COMMAND:-}"; fi
+  if [[ "$cmd" == "homelab-collect --version" ]] || allowed "$cmd"; then
+    if [[ "$mode" == match ]]; then
+      echo allowed
+      exit 0
+    fi
+    if [[ "$cmd" == "homelab-collect --version" ]]; then
+      version
+      exit 0
+    fi
+    read -r -a argv <<< "$cmd"
+    if [[ -e "$ETC/use-sudo" && "$(id -u)" != 0 ]]; then
+      # sudo -n exits 1 when sudoers does not allow the command, which the caller would read as
+      # the command's own exit 1 ("dpkg not in use", "no ZFS"): ask sudo first, refuse distinctly
+      if ! sudo -n -l -- "${argv[@]}" > /dev/null 2>&1; then
+        printf 'homelab-collect: refused (sudo): %s\n' "$cmd" >&2
+        audit "refused (sudo): $cmd"
+        exit 126
+      fi
+      audit "allowed: $cmd"
+      exec sudo -n -- "${argv[@]}"
+    fi
+    audit "allowed: $cmd"
+    exec "${argv[@]}"
+  fi
+  [[ -z "$LIST_ERROR" ]] || printf 'homelab-collect: %s\n' "$LIST_ERROR" >&2
+  if [[ "$mode" == match ]]; then
+    echo refused
+    exit 1
+  fi
+  printf 'homelab-collect: refused: %s\n' "$(shown "$cmd")" >&2
+  audit "refused: $(shown "$cmd")"
+  exit 126
+}
+
+main "$@"

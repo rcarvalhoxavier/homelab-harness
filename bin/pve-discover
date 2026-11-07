@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# pve-discover: the members, storages and guests of the Proxmox nodes in a fixed order (the evidence
+# of the llm-wiki DISCOVER operation); writes inventory/nodes on a fresh install. Read-only on hosts.
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-discover --seed ALIAS [--name NODE] [--quiet]
+       pve-discover [--quiet]
+
+Lists the members, storages and guests of your Proxmox nodes in a fixed order, so two runs over
+the same state are identical and a diff shows what changed: the evidence of the llm-wiki DISCOVER
+operation. Facts only, no usage figures.
+
+  --seed ALIAS  onboarding, before inventory/nodes exists: ALIAS is the collect alias of one node.
+                Reads the cluster members, tests the alias <member> of each, and writes
+                inventory/nodes with the ones that answer. Refused when the file exists.
+  --name NODE   with --seed: the Proxmox name of the seed node, when it cannot be told (a
+                standalone node whose /etc/pve/nodes lists several names)
+  no option     reconciliation: compares inventory/nodes with the live members; never writes.
+
+Read-only: collect aliases only, never an admin alias. Exit 1 when something could not be read
+(the report says what), 2 on a usage or configuration error.
+EOF
+}
+
+ORIG=()
+SEED=""
+SEED_NODE=""
+NAME_OPT=""
+RC=0
+REFUSED=0
+REPORT=()
+CLUSTERS=()
+INVENTORY_LINES=()
+READ_NODES=()
+NOT_READ=()
+STORAGE_ROWS=()
+GUEST_ROWS=()
+declare -A NODE_LINE=()
+declare -A LISTED_AS=()   # Proxmox name -> the inventory node that answered under another name
+
+emit() {
+  REPORT+=("$1")
+}
+
+# note_failure EXIT: a read failed (exit 1 at the end); a dispatcher refusal also gets a hint.
+note_failure() {
+  RC=1
+  if (($1 == 126)); then
+    REFUSED=1
+  fi
+}
+
+# probe NODE [MARK]: does the node's collect alias answer? Sets the node's line under "nodes:"
+# (with its pveversion line); returns 1 when it does not answer.
+probe() {
+  local node="$1" mark="${2:+ $2}" out reason rc=0
+  if ! pve_reachable "$node"; then
+    # ssh's own last line on a transport failure; any other text carries a timestamp
+    if ((${PVE_REACH_RC?} == 255)) && [[ -n "$PVE_REACH_ERR" ]]; then
+      reason="$PVE_REACH_ERR"
+    else
+      reason="exit $PVE_REACH_RC"
+    fi
+    _pve_alias_of "$node" collect
+    NODE_LINE[$node]="$node$mark unreachable (alias $REPLY: $reason)"
+    note_failure "$PVE_REACH_RC"
+    return 1
+  fi
+  out="$(pve_collect "$node" pveversion)" || rc=$?
+  out="${out%%$'\n'*}"
+  if ((rc == 0)) && [[ -n "$out" ]]; then
+    NODE_LINE[$node]="$node$mark reachable $out"
+  else
+    NODE_LINE[$node]="$node$mark reachable (version not read)"
+    note_failure "$rc"
+  fi
+}
+
+# read_members NODE: PVE_QUORUM_MEMBERS and PVE_QUORUM_LOCAL as NODE sees them, and its cluster
+# name (or "standalone") in CLUSTERS; returns 1 when they cannot be read.
+read_members() {
+  local node="$1" name
+  pve_quorum "$node"
+  if ! pve_quorum_members "$node"; then
+    log_error "could not read the cluster members of $node ($PVE_QUORUM_WHAT, exit $PVE_QUORUM_RC)"
+    note_failure "$PVE_QUORUM_RC"
+    return 1
+  fi
+  if [[ "$PVE_QUORUM_STATE" == cluster ]]; then
+    name="$(pve_parse_cluster_name <<< "$PVE_QUORUM_COROSYNC")"
+    CLUSTERS+=("cluster ${name:--}")
+  else
+    CLUSTERS+=("standalone")
+  fi
+}
+
+# read_facts NODE: the storages and the guest list of a node that answers.
+read_facts() {
+  local node="$1" out rc=0 name type status vmid
+  out="$(pve_collect "$node" pvesm status)" || rc=$?
+  if ((rc == 0)) && out="$(pve_parse_pvesm_status <<< "$out")" && [[ -n "$out" ]]; then
+    while read -r name type status _; do
+      STORAGE_ROWS+=("$name $type $node:$status")
+    done <<< "$out"
+  else
+    NOT_READ+=("storages not read: $node")
+    note_failure "$rc"
+  fi
+  rc=0
+  out="$(pve_guests "$node")" || rc=$?
+  if ((rc == 2)); then
+    exit 2
+  fi
+  if ((rc != 0)); then
+    NOT_READ+=("guests not read: $node")
+    note_failure "$rc"
+    return 0
+  fi
+  while read -r vmid type status name; do
+    [[ -z "$vmid" ]] || GUEST_ROWS+=("$vmid $node $type $status $name")
+  done <<< "$out"
+}
+
+# guest_lines VMID NODE TYPE STATUS NAME: the guest's line, and its description line when it has one.
+guest_lines() {
+  local id="$1" node="$2" type="$3" status="$4" name="$5" cli config key value fields="" disks desc rc=0
+  cli="$(pve_cli_of "$type")"
+  config="$(pve_collect "$node" "$cli" config "$id")" || rc=$?
+  if ((rc != 0)) || [[ -z "$config" ]]; then
+    emit "  $id $type $node $status $name (config not read)"
+    note_failure "$rc"
+    return 0
+  fi
+  if [[ "$type" == ct ]]; then key=hostname; else key=name; fi
+  value="$(pve_config_value "$key" <<< "$config")"
+  name="${value:-$name}"
+  for key in cores memory swap; do
+    value="$(pve_config_value "$key" <<< "$config")"
+    [[ -z "$value" ]] || fields+=" $key=$value"
+  done
+  disks="$(pve_parse_config_volumes <<< "$config" | awk '{ print $1 ":" $4 }' | paste -sd, -)"
+  [[ -z "$disks" ]] || fields+=" disks=$disks"
+  for key in tags onboot; do
+    value="$(pve_config_value "$key" <<< "$config")"
+    [[ -z "$value" ]] || fields+=" $key=$value"
+  done
+  emit "  $id $type $node $status $name$fields"
+  desc="$(awk 'index($0, "description: ") == 1 { print substr($0, 14); exit }' <<< "$config")"
+  [[ -z "$desc" ]] || desc="$(pve_clean_description "$desc")"
+  [[ -z "$desc" ]] || emit "    description: $desc"
+}
+
+# render: the whole report in REPORT (reads each guest's config on the way).
+render() {
+  local header node line vmid type status name
+  local -a kinds nodes
+  if ((${#CLUSTERS[@]} > 0)); then
+    mapfile -t kinds < <(printf '%s\n' "${CLUSTERS[@]}" | LC_ALL=C sort -u)
+    printf -v header '%s, ' "${kinds[@]}"
+    header="${header%, }"
+  else
+    header=unknown
+  fi
+  emit "pve-discover 1 | $header"
+  emit "nodes:"
+  mapfile -t nodes < <(printf '%s\n' "${!NODE_LINE[@]}" | LC_ALL=C sort)
+  for node in "${nodes[@]}"; do
+    emit "  ${NODE_LINE[$node]}"
+  done
+  for line in "${INVENTORY_LINES[@]}"; do
+    emit "$line"
+  done
+  emit "storages:"
+  if ((${#STORAGE_ROWS[@]} > 0)); then
+    # nodes were read in name order, so a stable sort keeps each storage's states in node order;
+    # a name with another type on some node (independent nodes) gets a line per type
+    while IFS= read -r line; do
+      emit "$line"
+    done < <(printf '%s\n' "${STORAGE_ROWS[@]}" | LC_ALL=C sort -s -k1,1 -k2,2 |
+      awk '$1 " " $2 != last { if (line != "") print line; last = $1 " " $2; line = "  " last }
+           { line = line " " $3 } END { print line }')
+  fi
+  emit "guests:"
+  if ((${#GUEST_ROWS[@]} > 0)); then
+    while read -r vmid node type status name; do
+      guest_lines "$vmid" "$node" "$type" "$status" "$name"
+    done < <(printf '%s\n' "${GUEST_ROWS[@]}" | LC_ALL=C sort -k1,1n -k2,2)
+  fi
+  if ((${#NOT_READ[@]} > 0)); then
+    while IFS= read -r line; do
+      emit "$line"
+    done < <(printf '%s\n' "${NOT_READ[@]}" | LC_ALL=C sort -u)
+  fi
+}
+
+# write_inventory: inventory/nodes with the nodes that answered, through a temporary file linked
+# into place, which never replaces a file created during the run.
+write_inventory() {
+  local dir="$PVE_ROOT/inventory" tmp node
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/.nodes.XXXXXX")"
+  pve_cleanup_add "$tmp"
+  {
+    printf '# written by pve-discover --seed %s on %s; edit freely\n' "$SEED" "$(date +%F)"
+    printf '# node collect admin\n'
+    for node in "${READ_NODES[@]}"; do
+      if [[ "$node" == "$SEED_NODE" && "$SEED" != "$node" ]]; then
+        printf '%s %s\n' "$node" "$SEED"
+      else
+        printf '%s\n' "$node"
+      fi
+    done
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  if ! ln "$tmp" "$dir/nodes" 2> /dev/null; then
+    [[ ! -e "$dir/nodes" && ! -L "$dir/nodes" ]] ||
+      pve_die 1 "inventory/nodes appeared during the run: nothing written"
+    mv -n "$tmp" "$dir/nodes"   # a filesystem without hard links
+  fi
+  rm -f "$tmp"
+}
+
+discover_seed() {
+  local node member members
+  local -a left_out=()
+  [[ ! -e "$PVE_ROOT/inventory/nodes" ]] ||
+    pve_die 2 "inventory/nodes exists; run pve-discover without --seed to reconcile"
+  pve_env_load "$PVE_ROOT/.env.local"
+  pve_inventory_reset
+  pve_inventory_add "$SEED"   # provisional: the alias stands for the node until its name is read
+  pve_audit_start pve-discover "${ORIG[@]}"
+  pve_reachable "$SEED" || pve_die 1 "the seed alias $SEED does not connect: nothing written"
+  read_members "$SEED" || pve_die 1 "nothing written"
+  members="$PVE_QUORUM_MEMBERS"
+  if [[ -n "$NAME_OPT" ]]; then
+    [[ " $members " == *" $NAME_OPT "* ]] || pve_die 2 "--name $NAME_OPT is not a member ($members)"
+    node="$NAME_OPT"
+  elif [[ -n "$PVE_QUORUM_LOCAL" ]]; then
+    node="$PVE_QUORUM_LOCAL"
+  else
+    pve_die 1 "cannot tell which member $SEED is ($members): pass --name NODE; nothing written"
+  fi
+  SEED_NODE="$node"
+  pve_inventory_reset
+  pve_inventory_add "$node" "$SEED"
+  probe "$node" seed || pve_die 1 "the seed alias $SEED stopped answering: nothing written"
+  READ_NODES=("$node")
+  for member in $members; do
+    [[ "$member" != "$node" ]] || continue
+    if [[ ! "$member" =~ $PVE_NAME_RE ]]; then
+      NODE_LINE[$member]="$member invalid name"
+      RC=1
+      continue
+    fi
+    if pve_alias_owner "$member"; then
+      NODE_LINE[$member]="$member unreachable (alias $member is already used by node $REPLY)"
+      # the line "<member>" alone would reuse that alias: the member needs one of its own
+      left_out+=("$member (give it a collect alias of its own, then add the line \"$member <alias>\")")
+      NOT_READ+=("guests not read: $member")
+      RC=1
+      continue
+    fi
+    pve_inventory_add "$member"
+    if probe "$member"; then
+      READ_NODES+=("$member")
+    else
+      left_out+=("$member (add the line \"$member\" once its alias connects)")
+      NOT_READ+=("guests not read: $member")
+    fi
+  done
+  mapfile -t READ_NODES < <(printf '%s\n' "${READ_NODES[@]}" | LC_ALL=C sort)
+  for node in "${READ_NODES[@]}"; do
+    read_facts "$node"
+  done
+  INVENTORY_LINES=("inventory: written")
+  for member in "${left_out[@]}"; do
+    INVENTORY_LINES+=("  left out: $member")
+  done
+  INVENTORY_LINES+=("admin aliases: not tested; inventory/nodes assumes <node>-admin")
+}
+
+discover_reconcile() {
+  local node member diff="" read_any=0 seen="" unread=" "
+  local -a inventory members split
+  [[ -f "$PVE_ROOT/inventory/nodes" ]] ||
+    pve_die 2 "no inventory/nodes: on a fresh install, run pve-discover --seed ALIAS (docs/proxmox-toolkit.md)"
+  pve_init pve-discover "${ORIG[@]}"
+  mapfile -t inventory < <(pve_nodes)
+  for node in "${inventory[@]}"; do
+    if probe "$node"; then
+      READ_NODES+=("$node")
+      if read_members "$node"; then
+        seen+=" $PVE_QUORUM_MEMBERS"
+        read_any=1
+        if [[ -n "$PVE_QUORUM_LOCAL" && "$PVE_QUORUM_LOCAL" != "$node" ]]; then
+          LISTED_AS[$PVE_QUORUM_LOCAL]="$node"
+          NODE_LINE[$node]="$node (Proxmox name $PVE_QUORUM_LOCAL)${NODE_LINE[$node]#"$node"}"
+        fi
+      else
+        NOT_READ+=("members not read: $node")
+        unread+="$node "
+      fi
+    else
+      NOT_READ+=("guests not read: $node")
+    fi
+  done
+  if ((read_any == 0)); then
+    INVENTORY_LINES=("inventory: not compared (no member list could be read)")
+  else
+    # an inventory may list independent nodes or clusters: the members are the union
+    read -r -a split <<< "$seen"
+    mapfile -t members < <(printf '%s\n' "${split[@]}" | LC_ALL=C sort -u)
+    for member in "${members[@]}"; do
+      if pve_node_known "$member"; then
+        continue
+      fi
+      if [[ ! "$member" =~ $PVE_NAME_RE ]]; then
+        NODE_LINE[$member]="$member invalid name"
+        RC=1
+        continue
+      fi
+      diff+=" +$member"
+      # an inventory node that answered under another name: already read, not a new node
+      [[ -z "${LISTED_AS[$member]:-}" ]] || continue
+      if pve_alias_owner "$member"; then
+        NODE_LINE[$member]="$member unreachable (alias $member is already used by node $REPLY)"
+        NOT_READ+=("guests not read: $member")
+        RC=1
+        continue
+      fi
+      pve_inventory_add "$member"
+      if probe "$member"; then
+        READ_NODES+=("$member")
+      else
+        NOT_READ+=("guests not read: $member")
+      fi
+    done
+    # a node that answered but whose own member list could not be read is unknown, not removed
+    for node in "${inventory[@]}"; do
+      [[ " ${members[*]} " == *" $node "* || "$unread" == *" $node "* ]] || diff+=" -$node"
+    done
+    if [[ -z "$diff" ]]; then
+      INVENTORY_LINES=("inventory: unchanged")
+    else
+      INVENTORY_LINES=("inventory: differs:$diff")
+    fi
+  fi
+  if ((${#READ_NODES[@]} > 0)); then
+    mapfile -t READ_NODES < <(printf '%s\n' "${READ_NODES[@]}" | LC_ALL=C sort)
+    for node in "${READ_NODES[@]}"; do
+      read_facts "$node"
+    done
+  fi
+}
+
+parse_args() {
+  pve_cli_parse "$@"
+  ((PVE_DRY_RUN == 0 && PVE_YES == 0)) || pve_usage_error "pve-discover only reads: --dry-run and --yes do not apply"
+  [[ -z "$PVE_NODE_OPT" ]] || pve_usage_error "--node does not apply (use --name with --seed)"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --seed)
+        (($# >= 2)) || pve_usage_error "--seed needs an alias"
+        SEED="$2"
+        shift
+        ;;
+      --name)
+        (($# >= 2)) || pve_usage_error "--name needs a node name"
+        NAME_OPT="$2"
+        shift
+        ;;
+      *) pve_usage_error "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$SEED" || "$SEED" =~ $PVE_NAME_RE ]] || pve_usage_error "invalid alias '$SEED'"
+  # discovery never reads through the unrestricted key
+  [[ "$SEED" != *-admin ]] || pve_usage_error "'$SEED' looks like an admin alias: pass the collect alias"
+  [[ -z "$NAME_OPT" || "$NAME_OPT" =~ $PVE_NAME_RE ]] || pve_usage_error "invalid node name '$NAME_OPT'"
+  [[ -z "$NAME_OPT" || -n "$SEED" ]] || pve_usage_error "--name needs --seed"
+}
+
+main() {
+  ORIG=("$@")
+  parse_args "$@"
+  if [[ -n "$SEED" ]]; then
+    discover_seed
+  else
+    discover_reconcile
+  fi
+  render
+  [[ -z "$SEED" ]] || write_inventory
+  printf '%s\n' "${REPORT[@]}"
+  if ((REFUSED == 1)); then
+    log_warn "a host's dispatcher refused a read: re-run bin/pve-collect-install on that node (docs/proxmox-toolkit.md)"
+  fi
+  ((RC == 0)) || exit 1
+}
+
+main "$@"

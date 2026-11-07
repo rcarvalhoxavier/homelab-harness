@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# pve-state: the state of one guest or node in a fixed order (infra-change baseline and after).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-state <vmid|node> [--node NODE] [--quiet]
+
+Prints the state of one guest or one node in a fixed order, so two runs over the same state are
+identical and a diff shows only what changed: the collector of infra-change baselines and
+afters. Facts only, no usage figures.
+
+  guest: type and node, status, config, snapshots, volumes, backups (with PVE_BACKUP_STORAGE)
+  node:  packages, running and newest kernel, storages, quorum and members, upgradable
+         packages, APT sources
+
+Read-only: uses the collect alias only. Exit 1 when the target cannot be read, 2 on a usage error.
+EOF
+}
+
+state_guest() {
+  local id="$1" node type cli config out status state
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  type="$PVE_GUEST_TYPE"
+  cli="$(pve_cli_of "$type")"
+  printf 'pve-state 1 | %s %s on %s\n' "$type" "$id" "$node"
+  out="$(pve_guest_status "$node" "$type" "$id")" || exit 1
+  [[ -n "$out" ]] || pve_die 1 "could not read the status of $type $id: empty answer"
+  printf 'status: %s\n' "$out"
+  config="$(pve_collect "$node" "$cli" config "$id")" || exit 1
+  [[ -n "$config" ]] || pve_die 1 "could not read the config of $type $id: empty answer"
+  printf 'config:\n'
+  pve_indent <<< "$config"
+  out="$(pve_collect "$node" "$cli" listsnapshot "$id")" || exit 1
+  # a real listing always has a "current" line
+  grep -q 'current' <<< "$out" || pve_die 1 "could not read the snapshots of $type $id: no current line"
+  printf 'snapshots:\n'
+  pve_parse_snapshots <<< "$out" | pve_indent
+  printf 'volumes:\n'
+  pve_parse_config_volumes <<< "$config" | pve_indent
+  if [[ -n "$PVE_BACKUP_STORAGE" ]]; then
+    # pvesm status lists only the storages enabled for this node: absent there is "unavailable",
+    # and so is one that is not active (an outage must not block every guest's baseline); any
+    # failure to list an active storage is a failed read
+    status="$(pve_collect "$node" pvesm status)" || exit 1
+    [[ -n "$(pve_parse_pvesm_status <<< "$status")" ]] || pve_die 1 "could not read the storages of $node: empty answer"
+    printf 'backups on %s:\n' "$PVE_BACKUP_STORAGE"
+    state="$(pve_parse_pvesm_status <<< "$status" | awk -v s="$PVE_BACKUP_STORAGE" '$1 == s { print $3 }')"
+    if [[ -z "$state" ]]; then
+      printf '  unavailable on %s\n' "$node"
+      return 0
+    fi
+    if [[ "$state" != active ]]; then
+      printf '  unavailable on %s (storage %s)\n' "$node" "$state"
+      return 0
+    fi
+    out="$(pve_guest_backups "$node" "$PVE_BACKUP_STORAGE" "$id")" || exit 1
+    pve_indent <<< "$out"
+  fi
+}
+
+state_node() {
+  local node="$1" out dir n path
+  dir="$(mktemp -d)"
+  pve_cleanup_add "$dir"
+  printf 'pve-state 1 | node %s\n' "$node"
+  out="$(pve_collect "$node" pveversion -v)" || exit 1
+  [[ -n "$out" ]] || pve_die 1 "could not read the packages of $node: empty answer"
+  printf 'packages:\n'
+  pve_indent <<< "$out"
+  out="$(pve_collect "$node" uname -r)" || exit 1
+  [[ -n "$out" ]] || pve_die 1 "could not read the running kernel of $node: empty answer"
+  printf 'kernel running: %s\n' "$out"
+  out="$(pve_collect "$node" ls /boot)" || exit 1
+  out="$(pve_newest_kernel <<< "$out")"
+  [[ -n "$out" ]] || pve_die 1 "could not read the newest kernel of $node: no vmlinuz in /boot"
+  printf 'kernel newest: %s\n' "$out"
+  out="$(pve_collect "$node" pvesm status)" || exit 1
+  out="$(pve_parse_pvesm_status <<< "$out")"
+  [[ -n "$out" ]] || pve_die 1 "could not read the storages of $node: empty answer"
+  printf 'storages:\n'
+  awk '{ print "  " $1, $2, $3 }' <<< "$out"
+  pve_quorum "$node"
+  case "$PVE_QUORUM_STATE" in
+    cluster)
+      printf 'quorum: expected %s, total %s, quorate %s\n' "$PVE_QUORUM_EXPECTED" "$PVE_QUORUM_TOTAL" "$PVE_QUORUM_QUORATE"
+      pve_quorum_members "$node" || pve_die 1 "could not read the cluster members of $node"
+      printf 'members: %s\n' "$PVE_QUORUM_MEMBERS"
+      ;;
+    standalone) printf 'quorum: standalone\n' ;;
+    *) pve_die 1 "could not read the quorum of $node ($PVE_QUORUM_WHAT, exit $PVE_QUORUM_RC)" ;;
+  esac
+  out="$(pve_collect "$node" apt list --upgradable)" || exit 1
+  printf 'upgradable:\n'
+  pve_parse_upgradable <<< "$out" | LC_ALL=C sort | pve_indent
+  printf 'apt sources:\n'
+  pve_apt_fetch "$node" "$dir" || exit 1
+  while read -r n path; do
+    printf '  %s:\n' "$path"
+    sed 's/^/    /' "$dir/$n"
+  done < "$dir/index"
+}
+
+main() {
+  local -a orig=("$@")
+  local target
+  pve_cli_parse "$@"
+  ((${#PVE_ARGS[@]} == 1)) || pve_usage_error "expected one target: a VMID or a node name"
+  target="${PVE_ARGS[0]}"
+  [[ "$target" != -* ]] || pve_usage_error "unknown option: $target"
+  pve_init pve-state "${orig[@]}"
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    state_guest "$target"
+  else
+    pve_target_node "$target"
+    pve_reachable "$target" || pve_die 1 "node $target is unreachable"
+    state_node "$target"
+  fi
+}
+
+main "$@"

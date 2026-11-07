@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Example instance collector: Pi-hole's versions and status in CT 101, for infra-change diffs.
+# Copy to local/bin/ and adapt; its allowlist lines are in examples/local/collect.allow.
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [[ "$root" != / && ! -f "$root/lib/pve/init.sh" ]]; do
+  root="$(dirname "$root")"
+done
+# shellcheck source=../../../lib/pve/init.sh
+source "$root/lib/pve/init.sh"
+pve_require_api 1
+
+usage() {
+  cat <<'EOF'
+Usage: pihole-state [--node NODE] [--quiet]
+
+Pi-hole's versions and status in CT 101 (read-only, through local/collect.allow).
+EOF
+}
+
+pve_cli_parse "$@"
+pve_init pihole-state "$@"
+pve_find_guest 101 || exit 1
+printf 'pihole-state 1 | ct 101 on %s\n' "$PVE_GUEST_NODE"
+# a failed read exits 1 (the collector contract), not with the raw ssh or dispatcher code
+versions="$(pve_ct_exec "$PVE_GUEST_NODE" 101 pihole -v)" || exit 1
+printf 'versions:\n'
+pve_indent <<< "$versions"
+status="$(pve_ct_exec "$PVE_GUEST_NODE" 101 pihole status)" || exit 1
+printf 'status:\n'
+pve_indent <<< "$status"

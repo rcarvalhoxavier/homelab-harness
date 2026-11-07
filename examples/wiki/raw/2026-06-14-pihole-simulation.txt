@@ -1,0 +1,13 @@
+$ pihole -up --check-only
+  [i] Checking for updates...
+  [i] Pi-hole Core:    update available
+  [i] Web Interface:   update available
+  [i] FTL:             update available
+$ apt-get -s dist-upgrade
+Reading package lists... Done
+Building dependency tree... Done
+Reading state information... Done
+Calculating upgrade... Done
+The following packages will be upgraded:
+  curl libcurl4 openssl
+3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.

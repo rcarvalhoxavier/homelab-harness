@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  framework:
+    # Only the upstream template runs the framework checks, pull requests from forks included (a
+    # pull request run reports the base repository). Copies and forks run the instance job instead.
+    if: github.repository == 'rcarvalhoxavier/homelab-harness'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+      - name: Lint the example wiki
+        run: bin/wiki-lint --wiki examples/wiki --today 2026-07-01
+      - name: Shellcheck
+        run: >-
+          shellcheck -x templates/hooks/pre-commit lib/pve/*.sh bin/pve-* remote/homelab-collect
+          examples/local/bin/* examples/local/selftest.d/* tests/sshd/setup.sh $(git ls-files '*.sh')
+      - name: Upstream ships no instance paths
+        run: |
+          found=0
+          for path in wiki local inventory .env.local .claude/rules/local.md; do
+            if [ -e "$path" ]; then
+              echo "::error::instance path '$path' must not exist upstream"
+              found=1
+            fi
+          done
+          exit "$found"
+
+  sshd:
+    # Layer 2 of the toolkit tests: a real sshd on the runner, with the forced-command dispatcher.
+    if: github.repository == 'rcarvalhoxavier/homelab-harness'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare a real sshd with the dispatcher
+        run: sudo tests/sshd/setup.sh
+      - name: The toolkit against the real sshd
+        run: |
+          set -o pipefail
+          HARNESS_SSHD_TEST=1 python3 -m unittest tests.test_pve_sshd -v 2>&1 | tee /tmp/sshd-test.log
+          ! grep -q 'skipped' /tmp/sshd-test.log
+      - name: sshd diagnostics
+        if: failure()
+        run: |
+          sudo sshd -T -C user=harness-ci,host=localhost,addr=127.0.0.1 | grep -Ei 'passwordauth|kbdinteractive|authorizedkeys' || true
+          sudo journalctl -u ssh -u ssh.socket --no-pager | tail -50 || true
+
+  instance:
+    # Every clone or fork of the template checks its own content.
+    if: github.repository != 'rcarvalhoxavier/homelab-harness'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Lint the wiki
+        if: hashFiles('wiki/AGENTS.md') != ''
+        run: bin/wiki-lint --wiki wiki
+      - name: Check the local dispatcher allowlist
+        if: hashFiles('local/collect.allow') != ''
+        run: bash remote/homelab-collect --check local/collect.allow

@@ -1,0 +1,37 @@
+# Framework allowlist of the homelab-collect dispatcher: exactly the read-only commands the
+# toolkit's collectors and checks send. Grammar: docs/proxmox-toolkit.md. Add your own
+# commands to local/collect.allow, never here.
+uname -r
+pveversion
+pveversion -v
+pvesm status
+pvesm list {storage}
+pvesm list {storage} --content backup
+pct list
+qm list
+pct status {id}
+qm status {id}
+pct config {id}
+qm config {id}
+pct listsnapshot {id}
+qm listsnapshot {id}
+pvecm status
+pvecm nodes
+ls /etc/pve/nodes
+cat /etc/pve/storage.cfg
+cat /etc/pve/corosync.conf
+lvs --noheadings --units b --nosuffix -o vg_name,lv_name,lv_size,data_percent,metadata_percent --select segtype=thin-pool
+lvs --noheadings --units b --nosuffix -o lv_name,vg_name,lv_size,data_percent
+vgs --noheadings --units b --nosuffix -o vg_name,vg_free
+zpool list -Hp -o name,size,alloc,free,cap,health
+free -b
+df -P -B1 /
+ls /boot
+apt list --upgradable
+apt-get -s dist-upgrade
+apt-get -s autoremove
+fuser /var/lib/dpkg/lock-frontend
+cat /etc/os-release
+cat /etc/apt/sources.list
+ls /etc/apt/sources.list.d
+cat {aptfile}

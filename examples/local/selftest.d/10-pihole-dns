@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Example instance check for pve-selftest: Pi-hole's DNS server (FTL) listens in CT 101.
+# Exit 0 PASS, 1 FAIL, 77 SKIP; the first line printed is the summary.
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [[ "$root" != / && ! -f "$root/lib/pve/init.sh" ]]; do
+  root="$(dirname "$root")"
+done
+# shellcheck source=../../../lib/pve/init.sh
+source "$root/lib/pve/init.sh"
+pve_require_api 1
+pve_env_load
+pve_inventory_load
+if ! pve_find_guest 101 2>/dev/null; then
+  echo "CT 101 is not in this homelab"
+  exit 77
+fi
+if out="$(pve_ct_exec "$PVE_GUEST_NODE" 101 pihole status 2>&1)" && grep -q 'listening' <<< "$out"; then
+  echo "pihole FTL listening in CT 101"
+  exit 0
+fi
+echo "pihole FTL not listening in CT 101"
+exit 1

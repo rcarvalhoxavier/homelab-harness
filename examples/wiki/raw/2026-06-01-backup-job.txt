@@ -1,0 +1,9 @@
+vzdump: backup-nightly
+	all 1
+	compress zstd
+	enabled 1
+	exclude 200
+	mode snapshot
+	prune-backups keep-last=3
+	schedule 23:00
+	storage nas-backup

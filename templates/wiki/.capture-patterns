@@ -1,0 +1,9 @@
+# One regular expression per line (Python syntax). In captures, every match is
+# replaced by <REDACTED:custom>; wiki-lint reports any match as E-SECRET.
+# This file is COMMITTED: put shapes and prefixes here, never a secret itself.
+# A literal secret belongs in .env.local (gitignored): wiki-capture redacts every
+# value there, except variables named like a location (NAS_HOST, BACKUP_STORAGE...).
+# For an `exposure: public` wiki, also consider your own names: domains
+# (\bhome\.example\.net\b), Wi-Fi SSIDs, device serial numbers.
+# Example: remove the leading "# " to enable it.
+# my-lab-wifi-psk-\w+

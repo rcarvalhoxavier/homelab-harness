@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Deterministic wiki checks. Implementation: lib/wikitools/lint.py."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from wikitools.lint import main  # noqa: E402
+
+sys.exit(main())

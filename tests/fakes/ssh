@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Fake ssh for the toolkit tests: answers from a scenario file and records every call.
+
+The scenario (JSON, path in $FAKE_SSH_SCENARIO) gives each alias a role:
+- collect: the read-only key; when "restricted", the real dispatcher decides first
+- admin: the unrestricted key; the command string goes through a real bash to recover its argv
+- unreachable: exit 255, as ssh does when the host is down
+Answers are looked up by node and command; a list answers successive calls in order; a key
+starting with "re:" is a regular expression. A command without an answer exits 127 and is
+recorded as unexpected.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+OPTIONS_WITH_VALUE = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def parse(argv):
+    options, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg.startswith("-") and len(arg) > 1:
+            if arg[1] in OPTIONS_WITH_VALUE and len(arg) == 2:
+                options.append(f"{arg} {argv[i + 1]}")
+                i += 2
+            else:
+                options.append(arg)
+                i += 1
+            continue
+        break
+    return options, argv[i], " ".join(argv[i + 1:])
+
+
+def lookup(scenario, node, key):
+    table = scenario["responses"].get(node or "", {})
+    entry = table.get(key)
+    if entry is None:
+        for pattern, value in table.items():
+            if pattern.startswith("re:") and re.fullmatch(pattern[3:], key):
+                entry = value
+                break
+    if not isinstance(entry, list):
+        return entry
+    state_path = Path(scenario["state"])
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    count = state.get(f"{node}|{key}", 0)
+    state[f"{node}|{key}"] = count + 1
+    state_path.write_text(json.dumps(state))
+    return entry[min(count, len(entry) - 1)]
+
+
+def main():
+    scenario = json.loads(Path(os.environ["FAKE_SSH_SCENARIO"]).read_text())
+    options, alias, command = parse(sys.argv[1:])
+    info = scenario["aliases"].get(alias, {"role": "unknown"})
+    record = {"tool": "ssh", "alias": alias, "role": info["role"], "node": info.get("node"),
+              "options": options, "command": command, "argv": command.split(" "),
+              "sshpass": "SSHPASS" in os.environ, "refused": False, "unexpected": False}
+
+    def finish(code, out="", err=""):
+        with open(scenario["log"], "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        sys.exit(code)
+
+    if info["role"] in ("unknown", "unreachable"):
+        finish(255, err=f"ssh: connect to host {alias} port 22: No route to host\n")
+    key = command
+    if info["role"] == "collect" and info.get("restricted"):
+        verdict = subprocess.run(["bash", scenario["dispatcher"], "--etc", scenario["etc"],
+                                  "--match", command], capture_output=True, text=True)
+        if verdict.stdout.strip() != "allowed":
+            record["refused"] = True
+            finish(126, err=f"homelab-collect: refused: {command}\n")
+    if info["role"] == "admin":
+        parsed = subprocess.run(["bash", "-c", "printf '%s\\0' " + command], capture_output=True)
+        record["argv"] = parsed.stdout.decode("utf-8").split("\0")[:-1]
+        key = " ".join(record["argv"])
+    answer = lookup(scenario, info["node"], key)
+    if answer is None:
+        record["unexpected"] = True
+        finish(127, err=f"fake ssh: no answer for {info['node']}: {key}\n")
+    finish(answer.get("exit", 0), answer.get("stdout", ""), answer.get("stderr", ""))
+
+
+if __name__ == "__main__":
+    main()

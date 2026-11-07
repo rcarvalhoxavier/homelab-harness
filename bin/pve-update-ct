@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# pve-update-ct: package upgrade inside one running container (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-update-ct <vmid> [--node NODE] [--snapshot] [--simulate] [--dry-run] [--yes]
+
+Upgrades the packages of one running container: apt (debian, ubuntu, devuan) or apk (alpine).
+--snapshot takes pre-update-<date>-<time> first, as the rollback. --simulate prints what would
+change and stops; it needs "pct exec", so it runs through the admin alias without --yes (the
+only exception to the changing-tool contract).
+EOF
+}
+
+# sim_valid PM: stdin is the output of a real simulation (apt summary line, apk "OK:" line).
+sim_valid() {
+  if [[ "$1" == apk ]]; then
+    grep -q '^OK:'
+  else
+    grep -Eq "$PVE_APT_SUMMARY_RE"
+  fi
+}
+
+main() {
+  local -a orig=("$@")
+  local id="" snapshot=0 simulate=0 node config ostype pm status out snap rc
+  local -a sim
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --snapshot) snapshot=1; shift ;;
+      --simulate) simulate=1; shift ;;
+      -*) pve_usage_error "unknown option: $1" ;;
+      *)
+        [[ -z "$id" ]] || pve_usage_error "expected one VMID"
+        id="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ "$id" =~ ^[0-9]{1,9}$ ]] || pve_usage_error "expected a VMID"
+  ((simulate == 0 || PVE_DRY_RUN == 0)) || pve_usage_error "--simulate and --dry-run cannot be combined"
+  ((simulate == 0 || snapshot == 0)) || pve_usage_error "--simulate and --snapshot cannot be combined"
+  pve_init pve-update-ct "${orig[@]}"
+  pve_find_guest "$id" || exit 1
+  node="$PVE_GUEST_NODE"
+  [[ "$PVE_GUEST_TYPE" == ct ]] || pve_check_fail "$id is a VM: pve-update-ct updates containers only"
+  config="$(pve_collect "$node" pct config "$id")" || pve_check_fail "cannot read the config of ct $id"
+  [[ -n "$config" ]] || pve_check_fail "cannot read the config of ct $id: empty answer"
+  ostype="$(pve_config_value ostype <<< "$config")"
+  case "$ostype" in
+    debian|ubuntu|devuan) pm=apt; sim=(env LC_ALL=C apt-get -s dist-upgrade) ;;
+    alpine) pm=apk; sim=(apk upgrade --simulate) ;;
+    *) pve_check_fail "unsupported ostype '${ostype:-unknown}': apt (debian, ubuntu, devuan) and apk (alpine) only" ;;
+  esac
+  pve_check_ok "ct $id on $node uses $pm ($ostype)"
+  status="$(pve_guest_status "$node" ct "$id")" || pve_check_fail "cannot read the status of ct $id"
+  [[ -n "$status" ]] || pve_check_fail "cannot read the status of ct $id: empty answer"
+  [[ "$status" == running ]] || pve_check_fail "ct $id is $status: start it first"
+  pve_check_ok "ct $id is running"
+  if ((simulate == 1)); then
+    log_info "the simulation runs through the admin alias (pct exec), without --yes"
+    out="$(pve_ct_exec_admin "$node" "$id" "${sim[@]}")" || pve_check_fail "the simulation failed in ct $id"
+    sim_valid "$pm" <<< "$out" || pve_check_fail "the simulation in ct $id returned no summary line"
+    printf 'simulation: %d packages would be upgraded or installed\n' "$(pve_parse_pkg_sim "$pm" <<< "$out")"
+    printf 'note: %s update was not run: the simulation reads the package lists as last refreshed; the upgrade refreshes them first\n' \
+      "$([[ "$pm" == apk ]] && echo apk || echo apt-get)"
+    exit 0
+  fi
+  pve_plan_reset
+  pve_hint target "ct $id on $node"
+  pve_hint path standard
+  if ((snapshot == 1)); then
+    snap="pre-update-$(date +%Y%m%d-%H%M)"
+    rc=0
+    pve_guest_has_snapshot "$node" ct "$id" "$snap" || rc=$?
+    ((rc != 2)) || pve_check_fail "cannot read the snapshots of ct $id"
+    ((rc != 0)) || pve_check_fail "ct $id already has a snapshot named $snap: wait a minute and retry"
+    pve_check_ok "snapshot name $snap is unused"
+    pve_require_snapshot_capable "$node" ct "$id"
+    pve_hint rollback "pct rollback $id $snap"
+    pve_plan_add "$node" pct snapshot "$id" "$snap"
+  else
+    pve_hint rollback "none: pass --snapshot, or take one with bin/pve-snapshot first"
+  fi
+  pve_hint baseline/after "bin/pve-state $id"
+  if [[ "$pm" == apt ]]; then
+    pve_plan_add "$node" pct exec "$id" -- env DEBIAN_FRONTEND=noninteractive apt-get update
+    pve_plan_add "$node" pct exec "$id" -- env DEBIAN_FRONTEND=noninteractive apt-get -y \
+      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
+  else
+    pve_plan_add "$node" pct exec "$id" -- apk update
+    pve_plan_add "$node" pct exec "$id" -- apk upgrade
+  fi
+  pve_plan_execute "Upgrade the packages of ct $id on $node?" || exit 1
+  ((PVE_DRY_RUN == 0)) || exit 0
+  if ((snapshot == 1)); then
+    rc=0
+    pve_guest_has_snapshot "$node" ct "$id" "$snap" || rc=$?
+    ((rc != 2)) || pve_verify_fail "cannot read the snapshots of ct $id after the command"
+    ((rc == 0)) || pve_verify_fail "snapshot $snap is not listed after the command"
+    pve_verify_ok "snapshot $snap is listed"
+  fi
+  status="$(pve_guest_status "$node" ct "$id")" || status="unknown"
+  if [[ "$status" == running ]]; then
+    pve_verify_ok "ct $id is running"
+  else
+    pve_verify_fail "ct $id is $status after the upgrade"
+  fi
+  out="$(pve_ct_exec_admin "$node" "$id" "${sim[@]}")" || pve_verify_fail "the simulation after the upgrade failed"
+  sim_valid "$pm" <<< "$out" || pve_verify_fail "the simulation after the upgrade returned no summary line"
+  if [[ "$(pve_parse_pkg_sim "$pm" <<< "$out")" == 0 ]]; then
+    pve_verify_ok "no package left to upgrade"
+  else
+    pve_verify_fail "packages are still pending in ct $id"
+  fi
+}
+
+main "$@"

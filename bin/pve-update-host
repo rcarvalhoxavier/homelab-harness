@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# pve-update-host: apt-get dist-upgrade of one Proxmox node (changing tool).
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-update-host <node> [--simulate] [--dry-run] [--yes]
+
+Upgrades one node with apt-get update and apt-get dist-upgrade (never "apt upgrade", which can
+leave Proxmox half-upgraded). --simulate runs apt-get -s dist-upgrade (read-only) and stops.
+Never reboots: it reports when the running kernel is older than the newest installed one, and
+the reboot is a change of its own. On a cluster, upgrade one node at a time.
+EOF
+}
+
+ENTERPRISE='enterprise\.proxmox\.com'
+UPGRADE=(env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef
+         -o Dpkg::Options::=--force-confold dist-upgrade)
+
+LISTS_NOTE="note: apt-get update was not run: the simulation reads the package lists as last refreshed; the upgrade refreshes them first"
+
+# kernel_note SIM: a note when the simulated upgrade installs a new kernel, which needs a reboot.
+kernel_note() {
+  local kernels
+  kernels="$(pve_parse_new_kernels <<< "$1" | paste -sd' ' -)"
+  [[ -z "$kernels" ]] ||
+    printf 'note: the upgrade installs a new kernel (%s): it runs only after a reboot, a change of its own\n' "$kernels"
+}
+
+# sim_check LABEL: a fresh apt simulation on $node through the shared removal guard (lib/pve).
+# Sets SIM_OUT and SIM_COUNT (and the guard's PVE_REMOVALS, PVE_REMOVAL_COUNT); warns on removals
+# the guard allows.
+sim_check() {
+  local label="$1"
+  SIM_OUT="$(pve_collect "$node" apt-get -s dist-upgrade)" || pve_check_fail "the $label simulation failed on $node"
+  pve_removal_guard "$node" "$label" "$SIM_OUT"
+  SIM_COUNT="$(pve_parse_pkg_sim apt <<< "$SIM_OUT")"
+  if ((PVE_REMOVAL_COUNT > 0)); then
+    pve_check_warn "the upgrade would remove packages ($PVE_REMOVALS)"
+  else
+    pve_check_ok "the $label simulation removes no package"
+  fi
+}
+
+main() {
+  local -a orig=("$@")
+  local node="" simulate=0 out rc dir enterprise fetched count running newest removed nremoved before
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --simulate) simulate=1; shift ;;
+      -*) pve_usage_error "unknown option: $1" ;;
+      *)
+        [[ -z "$node" ]] || pve_usage_error "expected one node"
+        node="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$node" ]] || pve_usage_error "expected a node"
+  ((simulate == 0 || PVE_DRY_RUN == 0)) || pve_usage_error "--simulate and --dry-run cannot be combined"
+  pve_init pve-update-host "${orig[@]}"
+  pve_target_node "$node"
+  pve_reachable "$node" || pve_check_fail "$node is unreachable"
+  pve_check_ok "$node is reachable"
+  if ((simulate == 1)); then
+    out="$(pve_collect "$node" apt-get -s dist-upgrade)" || pve_check_fail "the simulation failed on $node"
+    grep -Eq "$PVE_APT_SUMMARY_RE" <<< "$out" || pve_check_fail "the simulation on $node returned no summary line"
+    removed="$(pve_parse_pkg_removals <<< "$out" | paste -sd' ' -)"
+    nremoved="$(pve_parse_pkg_removals <<< "$out" | wc -l)"
+    printf 'simulation: %d packages would be upgraded or installed, %d removed\n' \
+      "$(pve_parse_pkg_sim apt <<< "$out")" "$nremoved"
+    grep -E '^(Inst|Remv) ' <<< "$out" || true
+    [[ -z "$removed" ]] || pve_check_warn "the upgrade would remove packages ($removed)"
+    kernel_note "$out"
+    printf '%s\n' "$LISTS_NOTE"
+    exit 0
+  fi
+  rc=0
+  pve_collect "$node" fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    1) pve_check_ok "dpkg is not in use" ;;
+    0) pve_check_fail "dpkg is in use on $node: wait for the running apt or dpkg to finish" ;;
+    *) pve_check_fail "cannot check the dpkg lock on $node (exit $rc)" ;;
+  esac
+  dir="$(mktemp -d)"
+  pve_cleanup_add "$dir"
+  fetched=1
+  pve_apt_fetch "$node" "$dir" || { fetched=0; pve_check_warn "could not read every APT source of $node"; }
+  enterprise="$(pve_apt_enabled "$dir" "$ENTERPRISE" '.' | paste -sd' ' -)"
+  if [[ -n "$enterprise" ]]; then
+    pve_check_warn "enterprise repositories enabled ($enterprise): without a subscription apt-get update fails; see bin/pve-repo-setup"
+  elif ((fetched == 1)); then
+    pve_check_ok "no enterprise repository enabled"
+  else
+    pve_check_warn "cannot tell whether an enterprise repository is enabled"
+  fi
+  sim_check "pre-upgrade"
+  before="$PVE_REMOVALS"
+  kernel_note "$SIM_OUT"
+  pve_plan_reset
+  pve_hint target "node $node"
+  pve_hint path risky
+  pve_hint rollback "none: apt cannot downgrade; capture bin/pve-state $node and run --simulate first"
+  pve_hint baseline/after "bin/pve-state $node"
+  if ((PVE_DRY_RUN == 1)); then
+    pve_plan_add "$node" env DEBIAN_FRONTEND=noninteractive apt-get update
+    pve_plan_add "$node" "${UPGRADE[@]}"
+    pve_plan_execute "Run apt-get dist-upgrade on $node?" || exit 1
+    exit 0
+  fi
+  # Phase 1: refresh the package lists. Phase 2 starts only after a simulation on the fresh lists.
+  pve_plan_add "$node" env DEBIAN_FRONTEND=noninteractive apt-get update
+  pve_plan_numbering 0 2
+  pve_plan_execute "Run apt-get update on $node, then (after a fresh simulation) dist-upgrade?" || exit 1
+  sim_check "post-update"
+  if [[ "$PVE_REMOVALS" != "$before" ]]; then
+    # the approval covered the list shown before apt-get update
+    printf 'removals after apt-get update: %s (before: %s)\n' "${PVE_REMOVALS:-none}" "${before:-none}"
+    ((PVE_YES == 0)) || pve_check_fail "the removal list changed after apt-get update: review it, then run the tool again"
+  fi
+  pve_plan_reset
+  pve_plan_add "$node" "${UPGRADE[@]}"
+  pve_plan_numbering 1 2
+  pve_plan_execute "Run apt-get dist-upgrade on $node ($SIM_COUNT packages to upgrade or install, $PVE_REMOVAL_COUNT to remove)?" \
+    "cancelled: apt-get update ran; dist-upgrade was not run" || exit 1
+  out="$(pve_collect "$node" apt-get -s dist-upgrade)" || pve_verify_fail "the simulation after the upgrade failed"
+  grep -Eq "$PVE_APT_SUMMARY_RE" <<< "$out" || pve_verify_fail "the simulation after the upgrade returned no summary line"
+  count="$(pve_parse_pkg_sim apt <<< "$out")"
+  if ((count == 0)); then
+    pve_verify_ok "no package left to upgrade"
+  else
+    pve_verify_fail "$count packages still pending"
+  fi
+  running="$(pve_collect "$node" uname -r)" || pve_verify_fail "cannot read the running kernel of $node"
+  [[ -n "$running" ]] || pve_verify_fail "cannot read the running kernel of $node: empty answer"
+  out="$(pve_collect "$node" ls /boot)" || pve_verify_fail "cannot read /boot on $node"
+  newest="$(pve_newest_kernel <<< "$out")"
+  [[ -n "$newest" ]] || pve_verify_fail "no installed kernel found in /boot of $node"
+  if [[ "$running" != "$newest" ]]; then
+    printf 'reboot needed: running %s, newest %s\n' "$running" "$newest"
+  else
+    printf 'kernel: running the newest (%s)\n' "$running"
+  fi
+}
+
+main "$@"

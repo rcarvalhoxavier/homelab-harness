@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# pve-selftest: is this installation able to collect safely? (read-only; --admin also probes admin)
+set -euo pipefail
+# shellcheck source=../lib/pve/init.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/pve/init.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: pve-selftest [--node NODE] [--admin] [--local-dir DIR] [--quiet]
+
+Checks, per node: the collect alias connects; the installed dispatcher matches this repo; the
+collect key is restricted (a command outside every allowlist must be refused); the parsers read
+the node's live output. --admin also checks that the admin alias connects. Then runs the
+instance checks in DIR/selftest.d/ (default local/selftest.d/): exit 0 PASS, 77 SKIP, anything
+else FAIL; PVE_SELFTEST_TIMEOUT (default 60 seconds) bounds each one.
+
+Exit 1 when any check fails, 2 on a usage or configuration error.
+EOF
+}
+
+PVE_SELFTEST_TIMEOUT="${PVE_SELFTEST_TIMEOUT:-60}"
+LVS_POOLS=(lvs --noheadings --units b --nosuffix -o "vg_name,lv_name,lv_size,data_percent,metadata_percent"
+           --select segtype=thin-pool)
+PASSED=0
+FAILED=0
+WARNED=0
+SKIPPED=0
+
+result() {
+  printf '%s %s\n' "$1" "$2"
+  case "$1" in
+    PASS) PASSED=$((PASSED + 1)) ;;
+    FAIL) FAILED=$((FAILED + 1)) ;;
+    WARN) WARNED=$((WARNED + 1)) ;;
+    SKIP) SKIPPED=$((SKIPPED + 1)) ;;
+  esac
+}
+
+check_restricted() {
+  local node="$1" err rc=0
+  _pve_alias_of "$node" collect
+  err="$({ _pve_run_ssh "$REPLY" id >/dev/null; } 2>&1)" || rc=$?
+  if ((rc == 126)) && [[ "$err" == *"$PVE_REFUSED_MARKER"* ]]; then
+    result PASS "$node: the collect key is restricted (id was refused)"
+  elif ((rc == 0)); then
+    result FAIL "$node: the collect key is not restricted (id ran): add the forced command, docs/ssh-access.md §5"
+  else
+    result FAIL "$node: the restriction probe failed (exit $rc)"
+  fi
+}
+
+check_contracts() {
+  local node="$1" out lines bad expected total quorate rc vg lv
+  if out="$(pve_collect "$node" pvesm status)" && lines="$(pve_parse_pvesm_status <<< "$out")" &&
+     [[ -n "$lines" ]]; then
+    bad="$(awk 'NF != 7 || ($3 == "active" && ($7 !~ /^[0-9.]+$/ || $7 + 0 > 100)) { print $1 }' <<< "$lines" |
+           paste -sd' ' -)"
+    if [[ -z "$bad" ]]; then
+      result PASS "$node: pvesm status parses (7 fields, active storages within 0-100%)"
+    else
+      result FAIL "$node: pvesm status does not parse as expected for: $bad"
+    fi
+  else
+    result FAIL "$node: pvesm status could not be read or parsed"
+  fi
+  pve_quorum "$node"
+  expected="$PVE_QUORUM_EXPECTED"
+  total="$PVE_QUORUM_TOTAL"
+  quorate="$PVE_QUORUM_QUORATE"
+  if [[ "$PVE_QUORUM_STATE" == standalone ]]; then
+    result SKIP "$node: pvecm status (standalone node)"
+  elif [[ "$PVE_QUORUM_STATE" == cluster ]]; then
+    if [[ "$expected" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] && ((expected >= 1 && total >= 1 && total <= expected)) &&
+       [[ "$quorate" == Yes || "$quorate" == No ]]; then
+      result PASS "$node: pvecm status parses ($total of $expected votes, quorate $quorate)"
+    else
+      result FAIL "$node: pvecm status parses to an impossible value: $expected $total $quorate"
+    fi
+  elif [[ "$PVE_QUORUM_WHAT" == "pvecm status" ]] && ((PVE_QUORUM_RC != 126 && PVE_QUORUM_RC != 255)); then
+    result FAIL "$node: pvecm status output could not be parsed (exit $PVE_QUORUM_RC)"
+  else
+    result FAIL "$node: $PVE_QUORUM_WHAT could not be read (exit $PVE_QUORUM_RC; see the message above)"
+  fi
+  rc=0
+  out="$(pve_collect "$node" "${LVS_POOLS[@]}")" || rc=$?
+  if ((rc != 0)); then
+    result FAIL "$node: thin pools could not be read (exit $rc; see the message above)"
+  elif [[ -z "$out" ]]; then
+    result SKIP "$node: thin pools (none found)"
+  elif lines="$(pve_parse_lvs_thinpools <<< "$out")" && [[ -n "$lines" ]]; then
+    # an inactive pool reports no percentages: a state of the node, not a fault of the toolkit
+    while read -r vg lv _; do
+      result WARN "$node: thin pool $vg/$lv is inactive (usage not reported): activate it with lvchange -ay $vg/$lv"
+    done < <(awk '$4 == "-" && $5 == "-"' <<< "$lines")
+    bad="$(awk '!($4 == "-" && $5 == "-") && ($4 !~ /^[0-9.]+$/ || $4 + 0 > 100 || $5 !~ /^[0-9.]+$/ || $5 + 0 > 100) { print $1 "/" $2 }' \
+           <<< "$lines" | paste -sd' ' -)"
+    if [[ -n "$bad" ]]; then
+      result FAIL "$node: thin pools do not parse as expected: $bad"
+    elif [[ -n "$(awk '!($4 == "-" && $5 == "-")' <<< "$lines")" ]]; then
+      result PASS "$node: thin pools parse (data and metadata within 0-100%)"
+    fi
+  else
+    result FAIL "$node: thin pools output could not be parsed"
+  fi
+}
+
+# check_version NODE: the node's Proxmox VE major version; 9 is experimental.
+check_version() {
+  local node="$1" out rc=0 major
+  out="$(pve_collect "$node" pveversion)" || rc=$?
+  if ((rc != 0)) || [[ -z "$out" ]]; then
+    result FAIL "$node: pveversion could not be read (exit $rc)"
+    return 0
+  fi
+  major="$(pve_major_version <<< "$out")"
+  case "$major" in
+    8) result PASS "$node: Proxmox VE 8 ($(sed -n 's|^\(pve-manager/[^/ ]*\).*|\1|p' <<< "$out" | head -n 1))" ;;
+    9) result WARN "$node: Proxmox VE 9 support is experimental (not yet verified on a real node): run --simulate and --dry-run before any change" ;;
+    *) result FAIL "$node: unsupported Proxmox VE version: ${out%% *}" ;;
+  esac
+}
+
+check_node() {
+  local node="$1" admin="$2" digest="$3" out rc
+  # the reason goes on the FAIL line, not twice
+  if ! pve_reachable "$node" 2> /dev/null; then
+    result FAIL "$node: the collect alias does not connect (uname -r, exit $PVE_REACH_RC)${PVE_REACH_ERR:+: $PVE_REACH_ERR}; see docs/ssh-access.md"
+    return 0
+  fi
+  result PASS "$node: the collect alias connects"
+  check_version "$node"
+  if [[ "$HOMELAB_SSHPASS" == 1 ]]; then
+    result SKIP "$node: dispatcher checks (the password fallback has no forced command)"
+  else
+    rc=0
+    out="$(pve_collect "$node" homelab-collect --version 2>/dev/null)" || rc=$?
+    if ((rc == 0)) && [[ "$out" == "homelab-collect $digest" ]]; then
+      result PASS "$node: the dispatcher matches the repo ($digest)"
+    elif ((rc == 0)) && [[ "$out" == "homelab-collect "* ]]; then
+      result WARN "$node: the dispatcher (${out#homelab-collect }) differs from the repo ($digest): run bin/pve-collect-install $node"
+    else
+      result WARN "$node: no dispatcher answers: see docs/proxmox-toolkit.md (Setup)"
+    fi
+    check_restricted "$node"
+  fi
+  check_contracts "$node"
+  if ((admin == 1)); then
+    if pve_admin "$node" true >/dev/null 2>&1; then
+      result PASS "$node: the admin alias connects"
+    else
+      result FAIL "$node: the admin alias does not connect"
+    fi
+  fi
+}
+
+run_local_checks() {
+  local dir="$1/selftest.d" check name out rc first
+  [[ -d "$dir" ]] || return 0
+  for check in "$dir"/*; do
+    [[ -f "$check" && -x "$check" ]] || continue
+    name="$(basename "$check")"
+    out="$(mktemp)"
+    pve_cleanup_add "$out"
+    rc=0
+    (cd "$PVE_ROOT" && pve_run_timeout "$PVE_SELFTEST_TIMEOUT" "$out" "$check") || rc=$?
+    first="$(head -n 1 "$out")"
+    case "$rc" in
+      0) result PASS "local $name: $first" ;;
+      77) result SKIP "local $name: $first" ;;
+      124) result FAIL "local $name: timed out after $PVE_SELFTEST_TIMEOUT s" ;;
+      *) result FAIL "local $name: ${first:-exit $rc}" ;;
+    esac
+  done
+}
+
+main() {
+  local -a orig=("$@")
+  local only="" admin=0 local_dir="" node digest
+  pve_cli_parse "$@"
+  set -- "${PVE_ARGS[@]}"
+  while (($# > 0)); do
+    case "$1" in
+      --local-dir)
+        (($# >= 2)) || pve_usage_error "$1 needs a value"
+        local_dir="$2"
+        shift 2
+        ;;
+      --admin) admin=1; shift ;;
+      *) pve_usage_error "unknown argument: $1" ;;
+    esac
+  done
+  [[ "$PVE_SELFTEST_TIMEOUT" =~ ^[0-9]+$ ]] || pve_usage_error "PVE_SELFTEST_TIMEOUT must be a number of seconds"
+  pve_init pve-selftest "${orig[@]}"
+  only="$PVE_NODE_OPT"
+  local_dir="${local_dir:-$PVE_ROOT/local}"
+  [[ "$local_dir" == /* ]] || local_dir="$PVE_ROOT/$local_dir"
+  printf 'pve-selftest 1\n'
+  if [[ -f "$PVE_ROOT/.env.local" ]]; then
+    result PASS "configuration: .env.local and inventory/nodes load (${#PVE_NODE_LIST[@]} nodes)"
+  else
+    result PASS "configuration: inventory/nodes loads (${#PVE_NODE_LIST[@]} nodes); no .env.local, defaults apply"
+  fi
+  if [[ "$HOMELAB_SSHPASS" == 1 ]]; then
+    result WARN "password fallback in use: no forced command, so read-only rests on the toolkit's code alone"
+  fi
+  digest="$(pve_collect_hash)"
+  for node in "${PVE_NODE_LIST[@]}"; do
+    if [[ -z "$only" || "$node" == "$only" ]]; then
+      check_node "$node" "$admin" "$digest"
+    fi
+  done
+  run_local_checks "$local_dir"
+  printf 'summary: %d passed, %d failed, %d warnings, %d skipped\n' "$PASSED" "$FAILED" "$WARNED" "$SKIPPED"
+  if ((FAILED > 0)); then
+    exit 1
+  fi
+}
+
+main "$@"
