@@ -99,6 +99,14 @@ class RedactionShapesTest(unittest.TestCase):
         out = r(text, exposure="public", keep=[re.compile(r"Controller \S+")])
         self.assertEqual(out.text, "NAS Controller 5.15.20.20 at <IP-1>\n")
 
+    def test_keep_never_protects_a_secret(self):
+        # --keep shields text from the address and hostname rules only: a pattern that also
+        # covers a password must not let it through.
+        text = "Controller password=hunter22abc token: abc123xyz9 at 10.0.0.5\n"
+        out = r(text, exposure="public", keep=[re.compile(r"Controller .*")])
+        self.assertEqual(out.text, "Controller password=<REDACTED:secret> token: <REDACTED:secret> at 10.0.0.5\n")
+        self.assertEqual(out.counts["secret"], 2)
+
 
 class EnvAndEntropyTest(unittest.TestCase):
     def test_env_values_are_secrets_unless_the_name_says_otherwise(self):

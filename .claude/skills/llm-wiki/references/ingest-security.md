@@ -110,7 +110,8 @@ This is the single exception to "never modify `raw/`":
   (`E-EXPOSURE`). Add your own domains, Wi-Fi names and serial numbers to
   `wiki/.capture-patterns`. A four-part version looks like an address: write it with a `v`
   prefix (`v6.3.0.45`) or after "version", "firmware", "build" or "release", or protect it with
-  `--keep`. Security findings (an API open without authentication, an unpatched service, a port
+  `--keep`, which shields text from these address and hostname rules only, never from the
+  secret rules. Security findings (an API open without authentication, an unpatched service, a port
   forwarded to the internet) must not be written at all.
 
 Switching an existing wiki from `private` to `public` does not clean it: git history keeps every
