@@ -178,8 +178,10 @@ Every changing tool:
 Exit codes: 0 done or nothing to do, 1 a check, step or verification failed (or you declined),
 2 usage, configuration, or confirmation needed without a terminal.
 
-The one exception: `pve-update-ct --simulate` runs `pct exec` through the admin alias without
-`--yes`, because a simulation inside a container needs it.
+The one exception: a simulation inside a container (`pve-update-ct` on every run, `pve-cleanup`
+on a container) runs `pct exec` through the admin alias without `--yes`, `--dry-run` included,
+because `pct exec` is not on the collect allowlist. It changes nothing, and it is the only admin
+call before the confirmation.
 
 ### Per-tool behavior
 
@@ -201,18 +203,34 @@ The one exception: `pve-update-ct --simulate` runs `pct exec` through the admin 
   half-configured: recover with `dpkg --configure -a` on the node, as an `infra-change` change of
   its own.
 - **`pve-update-ct`**: the simulation runs `env LC_ALL=C apt-get -s dist-upgrade` (Alpine: `apk
-  upgrade --simulate`) and must print a summary line. `--simulate` does not run `apt-get update`
-  (a `note:` line says so), so a container whose lists were never refreshed can show 0 packages
-  while the real run, which refreshes them first, upgrades many. `--snapshot` takes
-  `pre-update-<date>-<time>` and is verified after the plan. `--simulate` together with
+  upgrade --simulate`) inside the container. `pct exec` is not on the collect allowlist, so it goes
+  through the admin alias, without `--yes`; it is the only admin call before the confirmation.
+  `--simulate` prints the count of packages to upgrade or install and of packages to remove, and
+  names the removals (`Remv` lines; Alpine: `Purging` lines) as a WARNING. Every other run,
+  `--dry-run` included, runs the same simulation as a check before the plan and shows the same
+  count and removal list. The simulation must print a summary line, and an apt simulation whose
+  "N to remove" disagrees with its `Remv` lines fails the check: an output that cannot be trusted
+  never reads as "nothing to remove". The simulation does not run `apt-get update` (`apk update`
+  on Alpine), so a container whose lists were never refreshed can show 0 packages while the real
+  run upgrades many; `--simulate` and `--dry-run` print a `note:` line saying so. A real run is
+  therefore two confirmed phases: the snapshot (with `--snapshot`) and `apt-get update`, then a
+  fresh simulation, then the upgrade. When the removal list after the refresh differs from the one
+  shown before, the tool prints it; with `--yes` it then stops before the upgrade. `--snapshot`
+  takes `pre-update-<date>-<time>` and is verified after the plan. `--simulate` together with
   `--dry-run` or `--snapshot` is a usage error.
-- **`pve-cleanup`**: on a node it first runs `apt-get -s autoremove` through the collect alias and
-  shows the removal list (also with `--dry-run`), then applies the removal guard. It reports the
-  space freed, or that none was.
-- **The removal guard** (shared by `pve-update-host` and `pve-cleanup`): the check fails when the
-  simulation has no summary line, when its "N to remove" disagrees with its `Remv` lines, or when
-  it would remove `proxmox-ve`, `pve-manager`, `qemu-server`, `pve-container` or a package of the
-  running kernel (`proxmox-kernel-<uname -r>`, its `-signed` package, `pve-kernel-<uname -r>`).
+- **`pve-cleanup`**: it first simulates `apt-get -s autoremove` and shows the removal list (also
+  with `--dry-run`). On a node the simulation goes through the collect alias and then through the
+  removal guard. In a container it runs `env LC_ALL=C apt-get -s autoremove` through the admin
+  alias, without `--yes` (`pct exec` is not on the collect allowlist), and only its summary line
+  and its "N to remove" against the `Remv` lines are checked. When the container's autoremove would
+  remove packages, the rollback line says that apt cannot bring them back and to take a snapshot
+  with `bin/pve-snapshot` first. On a node it reports the space freed, or that none was.
+- **The removal guard** (shared by `pve-update-host` and `pve-cleanup` on a node): the check fails
+  when the simulation has no summary line, when its "N to remove" disagrees with its `Remv` lines,
+  or when it would remove `proxmox-ve`, `pve-manager`, `qemu-server`, `pve-container` or a package
+  of the running kernel (`proxmox-kernel-<uname -r>`, its `-signed` package, `pve-kernel-<uname
+  -r>`). The first two checks, `pve_sim_removals`, also validate every simulation inside a
+  container.
 - **`pve-move-disk`**: refuses a guest with a `lock:` and refuses `--delete-source` when the guest
   has snapshots (`parent:`). The source stays as an unused disk unless `--delete-source` is given.
   A container the tool shut down is restarted by a `recovery:` step if the move fails, but never
@@ -325,6 +343,7 @@ change in any release.
 | `pve_read`, `pve_must_read`, `pve_opt_read` | Collector reads with the failure rules above; redefine `pve_read_failed WHAT` to report a failure |
 | `pve_zpool_read STATUS` | `zpool list` as `pve_opt_read`, but a failed read when `STATUS` (`pvesm status`) lists a `zfspool` storage |
 | `pve_removal_guard NODE LABEL SIMULATION` | The removal guard of an apt simulation (`PVE_REMOVALS`, `PVE_REMOVAL_COUNT`) |
+| `pve_sim_removals WHERE LABEL SIMULATION` | The removals of an apt simulation, read only when its summary line and its `Remv` lines agree (same variables); the guard's first step, and the check of a simulation inside a container |
 | `pve_guests NODE` | `vmid ct\|vm status name` lines |
 | `pve_guest_has_snapshot NODE TYPE VMID NAME` | Three-state: 0 found, 1 absent, 2 unreadable; test for 2 before treating 1 as "absent" |
 | `pve_check_ok`, `pve_check_warn`, `pve_check_fail` | Pre-check lines (`fail` exits 1) |

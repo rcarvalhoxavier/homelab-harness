@@ -201,6 +201,12 @@ pve_parse_pkg_removals() {
   awk '/^Remv / { print $2 }'
 }
 
+# pve_parse_apk_purges: the names of the packages an apk simulation would remove, from its
+# "(i/n) Purging <name> (<version>)" lines.
+pve_parse_apk_purges() {
+  awk '/^\([0-9]+\/[0-9]+\) Purging / { print $3 }'
+}
+
 # pve_parse_new_kernels: the versioned kernel packages an apt simulation would newly install (an Inst
 # line with no installed version in brackets), e.g. proxmox-kernel-6.8.12-11-pve-signed.
 pve_parse_new_kernels() {

@@ -9,8 +9,10 @@ usage() {
 Usage: pve-cleanup <node|vmid> [--node NODE] [--dry-run] [--yes]
 
 Removes packages nothing depends on and empties the package cache (apt-get autoremove, apt-get
-clean) on one node, or inside one running container that uses apt. Reports the space freed on
-a node's root filesystem. It removes no snapshot, no backup and no guest data.
+clean) on one node, or inside one running container that uses apt. It first simulates the
+autoremove and shows what it would remove; in a container that simulation needs "pct exec", so it
+runs through the admin alias without --yes. Reports the space freed on a node's root filesystem.
+It removes no snapshot, no backup and no guest data.
 EOS
 }
 
@@ -26,6 +28,27 @@ available() {
   printf '%s\n' "$avail"
 }
 
+# show_removals: the check line with what the simulated autoremove would remove.
+show_removals() {
+  if ((PVE_REMOVAL_COUNT == 0)); then
+    pve_check_ok "the autoremove simulation removes no package"
+  else
+    pve_check_ok "the autoremove would remove $PVE_REMOVAL_COUNT package(s): $PVE_REMOVALS"
+  fi
+}
+
+# ct_simulation NODE VMID: simulates the autoremove inside the container and shows the list. "pct
+# exec" is not on the collect allowlist, so this read-only simulation goes through the admin alias
+# before any confirmation; an output that cannot be trusted fails the check (lib/pve).
+ct_simulation() {
+  local node="$1" id="$2" out
+  log_info "the simulation runs through the admin alias (pct exec), without --yes"
+  out="$(pve_ct_exec_admin "$node" "$id" env LC_ALL=C apt-get -s autoremove)" ||
+    pve_check_fail "the autoremove simulation failed in ct $id"
+  pve_sim_removals "in ct $id" autoremove "$out"
+  show_removals
+}
+
 cleanup_ct() {
   local id="$1" node config ostype status
   pve_find_guest "$id" || exit 1
@@ -39,10 +62,15 @@ cleanup_ct() {
   [[ -n "$status" ]] || pve_check_fail "cannot read the status of ct $id: empty answer"
   [[ "$status" == running ]] || pve_check_fail "ct $id is $status: start it first"
   pve_check_ok "ct $id on $node runs $ostype and is running"
+  ct_simulation "$node" "$id"
   pve_plan_reset
   pve_hint target "ct $id on $node"
   pve_hint path trivial
-  pve_hint rollback "none: only unused packages and the package cache are removed"
+  if ((PVE_REMOVAL_COUNT == 0)); then
+    pve_hint rollback "none needed: the autoremove removes no package; only the package cache is emptied"
+  else
+    pve_hint rollback "none: the autoremove removes $PVE_REMOVAL_COUNT package(s) and apt cannot bring them back; take a snapshot with bin/pve-snapshot first"
+  fi
   pve_hint baseline/after "bin/pve-state $id"
   pve_plan_add "$node" pct exec "$id" -- "${AUTOREMOVE[@]}"
   pve_plan_add "$node" pct exec "$id" -- apt-get clean
@@ -57,11 +85,7 @@ removal_guard() {
   local node="$1" out
   out="$(pve_collect "$node" apt-get -s autoremove)" || pve_check_fail "the autoremove simulation failed on $node"
   pve_removal_guard "$node" autoremove "$out"
-  if ((PVE_REMOVAL_COUNT == 0)); then
-    pve_check_ok "the autoremove simulation removes no package"
-  else
-    pve_check_ok "the autoremove would remove $PVE_REMOVAL_COUNT package(s): $PVE_REMOVALS"
-  fi
+  show_removals
 }
 
 cleanup_node() {

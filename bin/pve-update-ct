@@ -9,9 +9,11 @@ usage() {
 Usage: pve-update-ct <vmid> [--node NODE] [--snapshot] [--simulate] [--dry-run] [--yes]
 
 Upgrades the packages of one running container: apt (debian, ubuntu, devuan) or apk (alpine).
---snapshot takes pre-update-<date>-<time> first, as the rollback. --simulate prints what would
-change and stops; it needs "pct exec", so it runs through the admin alias without --yes (the
-only exception to the changing-tool contract).
+Before the plan it simulates the upgrade inside the container and shows how many packages it
+would upgrade and which it would remove; a real run refreshes the package lists, simulates again
+and stops a --yes run when the removals changed. --snapshot takes pre-update-<date>-<time> first,
+as the rollback. --simulate prints the simulation and stops. A simulation inside a container
+needs "pct exec", so it runs through the admin alias without --yes; nothing else does.
 EOF
 }
 
@@ -24,10 +26,37 @@ sim_valid() {
   fi
 }
 
+# simulate LABEL: a fresh simulation inside the container ($node, $id, $pm, $sim), read only when it
+# can be trusted: a failed command, a missing summary line or (apt) a "N to remove" that differs
+# from the Remv lines fails the check. Sets SIM_COUNT (packages to upgrade or install) and
+# PVE_REMOVALS, PVE_REMOVAL_COUNT (what it would remove: Remv lines, apk "Purging" lines).
+simulate() {
+  local name="${1:+$1 }simulation" out
+  out="$(pve_ct_exec_admin "$node" "$id" "${sim[@]}")" || pve_check_fail "the $name failed in ct $id"
+  if [[ "$pm" == apt ]]; then
+    pve_sim_removals "in ct $id" "$1" "$out"
+  else
+    sim_valid apk <<< "$out" || pve_check_fail "the $name in ct $id returned no summary line"
+    PVE_REMOVALS="$(pve_parse_apk_purges <<< "$out" | LC_ALL=C sort | paste -sd' ' -)"
+    PVE_REMOVAL_COUNT="$(pve_parse_apk_purges <<< "$out" | awk 'END { print NR }')"
+  fi
+  SIM_COUNT="$(pve_parse_pkg_sim "$pm" <<< "$out")"
+}
+
+# show_simulation LABEL: the check line with what the simulated upgrade would change.
+show_simulation() {
+  local what="the $1 simulation in ct $id: $SIM_COUNT package(s) to upgrade or install"
+  if ((PVE_REMOVAL_COUNT == 0)); then
+    pve_check_ok "$what, none to remove"
+  else
+    pve_check_warn "$what; the upgrade would remove $PVE_REMOVAL_COUNT package(s): $PVE_REMOVALS"
+  fi
+}
+
 main() {
   local -a orig=("$@")
-  local id="" snapshot=0 simulate=0 node config ostype pm status out snap rc
-  local -a sim
+  local id="" snapshot=0 simulate=0 node config ostype pm status out snap rc refresh before total ran
+  local -a sim update upgrade
   pve_cli_parse "$@"
   set -- "${PVE_ARGS[@]}"
   while (($# > 0)); do
@@ -53,8 +82,21 @@ main() {
   [[ -n "$config" ]] || pve_check_fail "cannot read the config of ct $id: empty answer"
   ostype="$(pve_config_value ostype <<< "$config")"
   case "$ostype" in
-    debian|ubuntu|devuan) pm=apt; sim=(env LC_ALL=C apt-get -s dist-upgrade) ;;
-    alpine) pm=apk; sim=(apk upgrade --simulate) ;;
+    debian|ubuntu|devuan)
+      pm=apt
+      refresh="apt-get update"
+      sim=(env LC_ALL=C apt-get -s dist-upgrade)
+      update=(env DEBIAN_FRONTEND=noninteractive apt-get update)
+      upgrade=(env DEBIAN_FRONTEND=noninteractive apt-get -y
+               -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade)
+      ;;
+    alpine)
+      pm=apk
+      refresh="apk update"
+      sim=(apk upgrade --simulate)
+      update=(apk update)
+      upgrade=(apk upgrade)
+      ;;
     *) pve_check_fail "unsupported ostype '${ostype:-unknown}': apt (debian, ubuntu, devuan) and apk (alpine) only" ;;
   esac
   pve_check_ok "ct $id on $node uses $pm ($ostype)"
@@ -64,16 +106,13 @@ main() {
   pve_check_ok "ct $id is running"
   if ((simulate == 1)); then
     log_info "the simulation runs through the admin alias (pct exec), without --yes"
-    out="$(pve_ct_exec_admin "$node" "$id" "${sim[@]}")" || pve_check_fail "the simulation failed in ct $id"
-    sim_valid "$pm" <<< "$out" || pve_check_fail "the simulation in ct $id returned no summary line"
-    printf 'simulation: %d packages would be upgraded or installed\n' "$(pve_parse_pkg_sim "$pm" <<< "$out")"
-    printf 'note: %s update was not run: the simulation reads the package lists as last refreshed; the upgrade refreshes them first\n' \
-      "$([[ "$pm" == apk ]] && echo apk || echo apt-get)"
+    simulate ""
+    printf 'simulation: %d packages would be upgraded or installed, %d removed\n' "$SIM_COUNT" "$PVE_REMOVAL_COUNT"
+    ((PVE_REMOVAL_COUNT == 0)) || pve_check_warn "the upgrade would remove packages ($PVE_REMOVALS)"
+    printf 'note: %s was not run: the simulation reads the package lists as last refreshed; the upgrade refreshes them first\n' \
+      "$refresh"
     exit 0
   fi
-  pve_plan_reset
-  pve_hint target "ct $id on $node"
-  pve_hint path standard
   if ((snapshot == 1)); then
     snap="pre-update-$(date +%Y%m%d-%H%M)"
     rc=0
@@ -82,22 +121,51 @@ main() {
     ((rc != 0)) || pve_check_fail "ct $id already has a snapshot named $snap: wait a minute and retry"
     pve_check_ok "snapshot name $snap is unused"
     pve_require_snapshot_capable "$node" ct "$id"
+  fi
+  # The plan must show what the upgrade would remove, so the simulation comes first: the only admin
+  # call before the confirmation, and a read-only one.
+  log_info "the simulation runs through the admin alias (pct exec), without --yes"
+  simulate pre-upgrade
+  show_simulation pre-upgrade
+  before="$PVE_REMOVALS"
+  ((PVE_DRY_RUN == 0)) ||
+    printf 'note: %s was not run: the simulation reads the package lists as last refreshed; a real run refreshes them and simulates again before the upgrade\n' \
+      "$refresh"
+  pve_plan_reset
+  pve_hint target "ct $id on $node"
+  pve_hint path standard
+  if ((snapshot == 1)); then
     pve_hint rollback "pct rollback $id $snap"
     pve_plan_add "$node" pct snapshot "$id" "$snap"
   else
     pve_hint rollback "none: pass --snapshot, or take one with bin/pve-snapshot first"
   fi
   pve_hint baseline/after "bin/pve-state $id"
-  if [[ "$pm" == apt ]]; then
-    pve_plan_add "$node" pct exec "$id" -- env DEBIAN_FRONTEND=noninteractive apt-get update
-    pve_plan_add "$node" pct exec "$id" -- env DEBIAN_FRONTEND=noninteractive apt-get -y \
-      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
-  else
-    pve_plan_add "$node" pct exec "$id" -- apk update
-    pve_plan_add "$node" pct exec "$id" -- apk upgrade
+  pve_plan_add "$node" pct exec "$id" -- "${update[@]}"
+  if ((PVE_DRY_RUN == 1)); then
+    pve_plan_add "$node" pct exec "$id" -- "${upgrade[@]}"
+    pve_plan_execute "Upgrade the packages of ct $id on $node?" || exit 1
+    exit 0
   fi
-  pve_plan_execute "Upgrade the packages of ct $id on $node?" || exit 1
-  ((PVE_DRY_RUN == 0)) || exit 0
+  # Phase 1: the snapshot (if any) and the refresh of the package lists. Phase 2, the upgrade,
+  # starts only after a simulation on the fresh lists, which can remove more than the first one.
+  total=$((${#PVE_PLAN[@]} + 1))
+  pve_plan_numbering 0 "$total"
+  pve_plan_execute "Run $refresh in ct $id on $node, then (after a fresh simulation) the upgrade?" || exit 1
+  simulate post-update
+  show_simulation post-update
+  if [[ "$PVE_REMOVALS" != "$before" ]]; then
+    # the approval covered the list shown before the refresh
+    printf 'removals after %s: %s (before: %s)\n' "$refresh" "${PVE_REMOVALS:-none}" "${before:-none}"
+    ((PVE_YES == 0)) || pve_check_fail "the removal list changed after $refresh: review it, then run the tool again"
+  fi
+  ran="$refresh"
+  ((snapshot == 0)) || ran="the snapshot and $refresh"
+  pve_plan_reset
+  pve_plan_add "$node" pct exec "$id" -- "${upgrade[@]}"
+  pve_plan_numbering $((total - 1)) "$total"
+  pve_plan_execute "Upgrade the packages of ct $id on $node ($SIM_COUNT to upgrade or install, $PVE_REMOVAL_COUNT to remove)?" \
+    "cancelled: $ran ran; the upgrade was not run" || exit 1
   if ((snapshot == 1)); then
     rc=0
     pve_guest_has_snapshot "$node" ct "$id" "$snap" || rc=$?

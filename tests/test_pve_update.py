@@ -313,6 +313,10 @@ CT_SIM = "pct exec 101 -- env LC_ALL=C apt-get -s dist-upgrade"
 APK_SIM_CMD = "pct exec 101 -- apk upgrade --simulate"
 APK_SIM = "(1/2) Upgrading musl (1.2.4-r2 -> 1.2.4-r3)\n(2/2) Installing zlib (1.3-r0)\nOK: 9 MiB in 20 packages\n"
 APK_NONE = "OK: 9 MiB in 20 packages\n"
+APK_SIM_PURGES = ("(1/2) Purging lighttpd (1.4.76-r0)\n(2/2) Upgrading musl (1.2.4-r2 -> 1.2.4-r3)\n"
+                  "OK: 9 MiB in 19 packages\n")
+LISTS_NOTE = ("note: apt-get update was not run: the simulation reads the package lists as last refreshed; "
+              "a real run refreshes them and simulates again before the upgrade\n")
 ALPINE = lambda: fx.CONFIGS["101"].replace("ostype: debian", "ostype: alpine")
 
 
@@ -366,13 +370,13 @@ class UpdateCtTest(unittest.TestCase):
         self.assertRegex(result.stdout, r"rollback: pct rollback 101 pre-update-\d{8}-\d{4}\n")
         self.assertRegex(result.stdout, r"step 1/3: ssh pve1-admin -- pct snapshot 101 pre-update-\d{8}-\d{4}\n")
         self.assertIn(f"step 2/3: ssh pve1-admin -- {CT_UPDATE}\n", result.stdout)
-        self.assertEqual(self.lab.commands("admin"), [])
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
 
     def test_simulate_uses_admin_without_yes(self):
         self.lab.respond("pve1", CT_SIM, stdout=fx.APT_SIM)
         result = self.lab.run("pve-update-ct", "101", "--simulate")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("simulation: 2 packages would be upgraded or installed\n"
+        self.assertIn("simulation: 2 packages would be upgraded or installed, 0 removed\n"
                       "note: apt-get update was not run: the simulation reads the package lists as last refreshed; the upgrade refreshes them first\n", result.stdout)
         self.assertEqual(self.lab.commands("admin"), [CT_SIM])
 
@@ -389,10 +393,12 @@ class UpdateCtTest(unittest.TestCase):
 
     def test_alpine_uses_apk(self):
         self.lab.respond("pve1", "pct config 101", stdout=fx.CONFIGS["101"].replace("ostype: debian", "ostype: alpine"))
+        self.lab.respond("pve1", APK_SIM_CMD, stdout=APK_SIM)
         result = self.lab.run("pve-update-ct", "101", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("step 1/2: ssh pve1-admin -- pct exec 101 -- apk update\n"
                       "step 2/2: ssh pve1-admin -- pct exec 101 -- apk upgrade\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD])
 
     def test_yes_updates_and_verifies(self):
         self.lab.respond("pve1", CT_UPDATE)
@@ -410,15 +416,16 @@ class UpdateCtTest(unittest.TestCase):
         self.assertIn("result: exit 255\n", result.stdout)
         self.assertIn("step 2 failed; the remaining steps were not run", result.stderr)
         admin = self.lab.commands("admin")
-        self.assertEqual(len(admin), 2)
-        self.assertRegex(admin[0], r"^pct snapshot 101 pre-update-\d{8}-\d{4}$")
-        self.assertEqual(admin[1], CT_UPDATE)
+        self.assertEqual(len(admin), 3)
+        self.assertEqual(admin[0], CT_SIM)
+        self.assertRegex(admin[1], r"^pct snapshot 101 pre-update-\d{8}-\d{4}$")
+        self.assertEqual(admin[2], CT_UPDATE)
 
     def test_leftover_option_and_no_terminal(self):
         self.assertEqual(self.lab.run("pve-update-ct", "101", "--dryrun").returncode, 2)
         result = self.lab.run("pve-update-ct", "101")
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.lab.commands("admin"), [])
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
 
     def test_unreadable_snapshot_list_fails_the_check(self):
         self.lab.respond("pve1", "pct listsnapshot 101", exit=255, stderr="ssh: boom\n")
@@ -437,7 +444,7 @@ class UpdateCtTest(unittest.TestCase):
         self.lab.respond("pve1", APK_SIM_CMD, stdout=APK_SIM)
         result = self.lab.run("pve-update-ct", "101", "--simulate")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("simulation: 2 packages would be upgraded or installed\n", result.stdout)
+        self.assertIn("simulation: 2 packages would be upgraded or installed, 0 removed\n", result.stdout)
         self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD])
 
     def test_alpine_yes_runs_and_verifies(self):
@@ -447,7 +454,8 @@ class UpdateCtTest(unittest.TestCase):
         self.lab.respond("pve1", APK_SIM_CMD, stdout=APK_NONE)
         result = self.lab.run("pve-update-ct", "101", "--yes")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.lab.commands("admin"), ["pct exec 101 -- apk update", "pct exec 101 -- apk upgrade", APK_SIM_CMD])
+        self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD, "pct exec 101 -- apk update", APK_SIM_CMD,
+                                                      "pct exec 101 -- apk upgrade", APK_SIM_CMD])
         self.assertTrue(result.stdout.endswith("verify: no package left to upgrade: ok\n"))
 
     def test_alpine_garbage_simulation_fails(self):
@@ -460,7 +468,8 @@ class UpdateCtTest(unittest.TestCase):
     def test_garbage_simulation_fails_verify(self):
         self.lab.respond("pve1", CT_UPDATE)
         self.lab.respond("pve1", CT_UPGRADE)
-        self.lab.respond("pve1", CT_SIM, stdout="garbage\n")
+        # the simulations before the upgrade are sound; only the one after it is garbage
+        self.lab.respond_seq("pve1", CT_SIM, fx.ok(fx.CT_APT_SIM), fx.ok(fx.CT_APT_SIM), fx.ok("garbage\n"))
         result = self.lab.run("pve-update-ct", "101", "--yes")
         self.assertEqual(result.returncode, 1)
         self.assertIn("verify: the simulation after the upgrade returned no summary line: FAILED", result.stdout)
@@ -526,6 +535,9 @@ class UpdateCtTest(unittest.TestCase):
         result = self.same_minute(attempt)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"verify: snapshot pre-update-\d{8}-\d{4} is listed: ok\n")
+        self.assertRegex(result.stdout, r"step 1/3: ssh pve1-admin -- pct snapshot 101 pre-update-\d{8}-\d{4}\n")
+        self.assertIn(f"step 2/3: ssh pve1-admin -- {CT_UPDATE}\n", result.stdout)
+        self.assertIn(f"step 3/3: ssh pve1-admin -- {CT_UPGRADE}\n", result.stdout)
 
     def test_missing_or_unreadable_snapshot_fails_verify(self):
         missing = self._snapshot_run({"stdout": fx.SNAPSHOTS["101"]})
@@ -537,6 +549,162 @@ class UpdateCtTest(unittest.TestCase):
         unreadable = self._snapshot_run({"stdout": "", "exit": 255, "stderr": "boom\n"})
         self.assertEqual(unreadable.returncode, 1)
         self.assertIn("cannot read the snapshots of ct 101 after the command: FAILED", unreadable.stdout)
+
+    # -- the simulation before the plan --------------------------------------------------
+    def bad_simulations(self):
+        summary = "0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\n"
+        return [{"exit": 255, "stderr": "ssh: boom\n"}, {"exit": 100, "stderr": "E: Could not get lock\n"},
+                {"stdout": ""}, {"stdout": "Reading package lists...\n"},
+                {"stdout": "Reading package lists...\n" + summary + "Remv lighttpd [1.4.69-1]\n"}]
+
+    def test_simulate_lists_removals(self):
+        self.lab.respond("pve1", CT_SIM, stdout=fx.CT_APT_SIM_REMOVES)
+        result = self.lab.run("pve-update-ct", "101", "--simulate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("simulation: 1 packages would be upgraded or installed, 1 removed\n", result.stdout)
+        self.assertIn("check: the upgrade would remove packages (lighttpd): WARNING\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_simulate_whose_count_disagrees_fails(self):
+        summary = "0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\n"
+        self.lab.respond("pve1", CT_SIM, stdout="Reading package lists...\n" + summary + "Remv lighttpd [1.4.69-1]\n")
+        result = self.lab.run("pve-update-ct", "101", "--simulate")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("check: the simulation in ct 101 states 2 package(s) to remove but lists 1: do not trust it: "
+                      "FAILED\n", result.stdout)
+        self.assertNotIn("simulation: ", result.stdout)
+
+    def test_dry_run_shows_the_counts_and_the_removals(self):
+        self.lab.respond("pve1", CT_SIM, stdout=fx.CT_APT_SIM_REMOVES)
+        result = self.lab.run("pve-update-ct", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: the pre-upgrade simulation in ct 101: 1 package(s) to upgrade or install; "
+                      "the upgrade would remove 1 package(s): lighttpd: WARNING\n" + LISTS_NOTE, result.stdout)
+        self.assertIn("the simulation runs through the admin alias (pct exec), without --yes", result.stderr)
+        self.assertIn(f"step 1/2: ssh pve1-admin -- {CT_UPDATE}\nstep 2/2: ssh pve1-admin -- {CT_UPGRADE}\n",
+                      result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_dry_run_without_removals_says_none(self):
+        result = self.lab.run("pve-update-ct", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: the pre-upgrade simulation in ct 101: 2 package(s) to upgrade or install, "
+                      "none to remove: ok\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_untrusted_pre_upgrade_simulation_stops_before_any_change(self):
+        for answer in self.bad_simulations():
+            with self.subTest(answer=answer):
+                self.lab.log.unlink(missing_ok=True)
+                self.lab.respond("pve1", CT_SIM, **answer)
+                self.lab.respond("pve1", CT_UPDATE)
+                self.lab.respond("pve1", CT_UPGRADE)
+                for args in (("--dry-run",), ("--yes",), ("--snapshot", "--yes")):
+                    result = self.lab.run("pve-update-ct", "101", *args)
+                    self.assertEqual(result.returncode, 1, args)
+                    self.assertIn("pre-upgrade simulation", result.stdout)
+                    self.assertIn("FAILED", result.stdout)
+                    self.assertNotIn("step 1/", result.stdout)
+                self.assertEqual(set(self.lab.commands("admin")), {CT_SIM})
+
+    def test_without_terminal_only_the_simulation_is_sent(self):
+        self.lab.respond("pve1", CT_SIM, stdout=fx.CT_APT_SIM_REMOVES)
+        result = self.lab.run("pve-update-ct", "101", "--snapshot")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("the upgrade would remove 1 package(s): lighttpd", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_declined_first_prompt_sends_only_the_simulation(self):
+        result = self.lab.run_tty(["bash", str(self.lab.root / "bin" / "pve-update-ct"), "101"], "n\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_yes_simulates_again_after_the_refresh(self):
+        self.lab.respond("pve1", CT_UPDATE)
+        self.lab.respond("pve1", CT_UPGRADE)
+        self.lab.respond_seq("pve1", CT_SIM, fx.ok(fx.CT_APT_SIM), fx.ok(fx.CT_APT_SIM), fx.ok(fx.APT_SIM_NONE))
+        result = self.lab.run("pve-update-ct", "101", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_UPDATE, CT_SIM, CT_UPGRADE, CT_SIM])
+        self.assertIn(f"step 1/2: ssh pve1-admin -- {CT_UPDATE}\n", result.stdout)
+        self.assertIn("check: the post-update simulation in ct 101: 2 package(s) to upgrade or install, "
+                      "none to remove: ok\n", result.stdout)
+        self.assertIn(f"step 2/2: ssh pve1-admin -- {CT_UPGRADE}\n", result.stdout)
+
+    def test_a_removal_that_appears_after_the_refresh_stops_a_yes_run(self):
+        self.lab.respond("pve1", CT_UPDATE)
+        self.lab.respond("pve1", CT_UPGRADE)
+        self.lab.respond_seq("pve1", CT_SIM, fx.ok(fx.CT_APT_SIM), fx.ok(fx.CT_APT_SIM_REMOVES))
+        result = self.lab.run("pve-update-ct", "101", "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("removals after apt-get update: lighttpd (before: none)\n", result.stdout)
+        self.assertIn("the removal list changed after apt-get update: review it, then run the tool again", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_UPDATE, CT_SIM])
+
+    def test_a_changed_removal_list_is_shown_before_the_second_prompt(self):
+        self.lab.respond("pve1", CT_UPDATE)
+        self.lab.respond_seq("pve1", CT_SIM, fx.ok(fx.CT_APT_SIM), fx.ok(fx.CT_APT_SIM_REMOVES))
+        result = self.lab.run_tty(["bash", str(self.lab.root / "bin" / "pve-update-ct"), "101"], "y\nn\n")
+        self.assertEqual(result.returncode, 1)
+        out = result.stdout + result.stderr
+        self.assertIn("removals after apt-get update: lighttpd (before: none)\n", result.stdout)
+        self.assertIn("(1 to upgrade or install, 1 to remove)", out)
+        self.assertIn("cancelled: apt-get update ran; the upgrade was not run\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_UPDATE, CT_SIM])
+
+    def test_untrusted_post_update_simulation_stops_before_the_upgrade(self):
+        self.lab.respond("pve1", CT_UPDATE)
+        self.lab.respond("pve1", CT_UPGRADE)
+        for answer in self.bad_simulations():
+            with self.subTest(answer=answer):
+                self.lab.log.unlink(missing_ok=True)
+                (self.lab.base / "state.json").unlink(missing_ok=True)
+                self.lab.respond_seq("pve1", CT_SIM, fx.ok(fx.CT_APT_SIM), answer)
+                result = self.lab.run("pve-update-ct", "101", "--yes")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("post-update simulation", result.stdout)
+                self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_UPDATE, CT_SIM])
+
+    def test_alpine_simulate_lists_purges(self):
+        self.lab.respond("pve1", "pct config 101", stdout=ALPINE())
+        self.lab.respond("pve1", APK_SIM_CMD, stdout=APK_SIM_PURGES)
+        result = self.lab.run("pve-update-ct", "101", "--simulate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("simulation: 1 packages would be upgraded or installed, 1 removed\n", result.stdout)
+        self.assertIn("check: the upgrade would remove packages (lighttpd): WARNING\n", result.stdout)
+        self.assertIn("note: apk update was not run", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD])
+
+    def test_alpine_dry_run_shows_the_simulation(self):
+        self.lab.respond("pve1", "pct config 101", stdout=ALPINE())
+        self.lab.respond("pve1", APK_SIM_CMD, stdout=APK_SIM_PURGES)
+        result = self.lab.run("pve-update-ct", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: the pre-upgrade simulation in ct 101: 1 package(s) to upgrade or install; "
+                      "the upgrade would remove 1 package(s): lighttpd: WARNING\n"
+                      "note: apk update was not run: the simulation reads the package lists as last refreshed; "
+                      "a real run refreshes them and simulates again before the upgrade\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD])
+
+    def test_alpine_untrusted_simulation_stops_before_any_change(self):
+        self.lab.respond("pve1", "pct config 101", stdout=ALPINE())
+        for answer in ({"stdout": "garbage\n"}, {"stdout": ""}, {"exit": 1, "stderr": "ERROR: boom\n"}):
+            with self.subTest(answer=answer):
+                self.lab.log.unlink(missing_ok=True)
+                self.lab.respond("pve1", APK_SIM_CMD, **answer)
+                result = self.lab.run("pve-update-ct", "101", "--yes")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("pre-upgrade simulation", result.stdout)
+                self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD])
+
+    def test_alpine_purge_that_appears_after_the_refresh_stops_a_yes_run(self):
+        self.lab.respond("pve1", "pct config 101", stdout=ALPINE())
+        self.lab.respond("pve1", "pct exec 101 -- apk update")
+        self.lab.respond_seq("pve1", APK_SIM_CMD, fx.ok(APK_SIM), fx.ok(APK_SIM_PURGES))
+        result = self.lab.run("pve-update-ct", "101", "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("removals after apk update: lighttpd (before: none)\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [APK_SIM_CMD, "pct exec 101 -- apk update", APK_SIM_CMD])
 
 
 if __name__ == "__main__":

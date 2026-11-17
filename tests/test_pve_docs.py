@@ -80,6 +80,18 @@ class DocsTest(unittest.TestCase):
         for phrase in ("could not read", "Remv", "lock:", "recovery:", "root:root", "pve_guest_has_snapshot"):
             self.assertIn(phrase, guide)
 
+    def test_guide_describes_the_container_simulations(self):
+        guide = " ".join((ROOT / "docs" / "proxmox-toolkit.md").read_text().split())
+        update_ct = guide[guide.index("- **`pve-update-ct`**"):guide.index("- **`pve-cleanup`**")]
+        cleanup = guide[guide.index("- **`pve-cleanup`**"):guide.index("- **The removal guard**")]
+        for bullet in (update_ct, cleanup):
+            self.assertIn("through the admin alias, without `--yes`", bullet)
+            self.assertIn("`Remv` lines", bullet)
+        for phrase in ("`--dry-run` included, runs the same simulation as a check before the plan",
+                       "`Purging` lines", "with `--yes` it then stops before the upgrade"):
+            self.assertIn(phrase, update_ct)
+        self.assertIn("take a snapshot with `bin/pve-snapshot` first", cleanup)
+
 
 class DiscoverDocsTest(unittest.TestCase):
     def test_the_discover_operation_is_documented(self):

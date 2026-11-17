@@ -4,6 +4,9 @@ from tests import pvefixtures as fx
 from tests.toolkit import Lab
 
 AUTOREMOVE = "env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove"
+CT_SIM = "pct exec 101 -- env LC_ALL=C apt-get -s autoremove"
+CT_AUTOREMOVE = f"pct exec 101 -- {AUTOREMOVE}"
+CT_CLEAN = "pct exec 101 -- apt-get clean"
 FAST_STATUS = "fast           lvmthin     active       500000000        10000000       490000000    2.00%\n"
 FAST_CFG = "\nlvmthin: fast\n\tthinpool fast\n\tvgname ssd\n\tcontent rootdir,images\n"
 
@@ -49,11 +52,85 @@ class CleanupTest(unittest.TestCase):
         self.assertEqual(self.lab.commands("admin"), [AUTOREMOVE])
 
     def test_container_step_failure_has_no_verify(self):
-        self.lab.respond("pve1", f"pct exec 101 -- {AUTOREMOVE}", exit=1)
+        self.lab.respond("pve1", CT_AUTOREMOVE, exit=1)
         result = self.lab.run("pve-cleanup", "101", "--yes")
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("verify:", result.stdout)
-        self.assertEqual(len(self.lab.commands("admin")), 1)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_AUTOREMOVE])
+
+    def test_container_dry_run_shows_what_autoremove_would_remove(self):
+        self.lab.respond("pve1", CT_SIM, stdout=fx.CT_AUTOREMOVE_SIM_REMOVES)
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: the autoremove would remove 2 package(s): libldap-2.5-0 lighttpd: ok\n", result.stdout)
+        self.assertIn("rollback: none: the autoremove removes 2 package(s) and apt cannot bring them back; "
+                      "take a snapshot with bin/pve-snapshot first\n", result.stdout)
+        self.assertNotIn("only unused packages and the package cache are removed", result.stdout)
+        self.assertIn("the simulation runs through the admin alias (pct exec), without --yes", result.stderr)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_container_with_nothing_to_remove_says_so(self):
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: the autoremove simulation removes no package: ok\n", result.stdout)
+        self.assertIn("rollback: none needed: the autoremove removes no package; only the package cache is emptied\n",
+                      result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_container_without_terminal_sends_only_the_simulation(self):
+        self.lab.respond("pve1", CT_SIM, stdout=fx.CT_AUTOREMOVE_SIM_REMOVES)
+        result = self.lab.run("pve-cleanup", "101")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("check: the autoremove would remove 2 package(s): libldap-2.5-0 lighttpd: ok\n", result.stdout)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_container_declined_sends_only_the_simulation(self):
+        result = self.lab.run_tty(["bash", str(self.lab.root / "bin" / "pve-cleanup"), "101"], "n\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM])
+
+    def test_container_yes_simulates_then_cleans(self):
+        self.lab.respond("pve1", CT_AUTOREMOVE)
+        self.lab.respond("pve1", CT_CLEAN)
+        result = self.lab.run("pve-cleanup", "101", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lab.commands("admin"), [CT_SIM, CT_AUTOREMOVE, CT_CLEAN])
+
+    def test_container_simulation_that_cannot_be_trusted_stops_the_tool(self):
+        bad = [{"exit": 255, "stderr": "ssh: boom\n"}, {"exit": 1, "stderr": "E: Could not get lock\n"},
+               {"stdout": ""}, {"stdout": "Reading package lists...\n"},
+               {"stdout": self.sim(["lighttpd"], summary="0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\n")}]
+        for answer in bad:
+            with self.subTest(answer=answer):
+                self.lab.log.unlink(missing_ok=True)
+                self.lab.respond("pve1", CT_SIM, **answer)
+                for args in (("--dry-run",), ("--yes",)):
+                    result = self.lab.run("pve-cleanup", "101", *args)
+                    self.assertEqual(result.returncode, 1, args)
+                    self.assertIn("autoremove simulation", result.stdout)
+                    self.assertIn("FAILED", result.stdout)
+                    self.assertNotIn("step 1/2", result.stdout)
+                self.assertEqual(set(self.lab.commands("admin")), {CT_SIM})
+
+    def test_container_simulation_messages_name_the_container(self):
+        self.lab.respond("pve1", CT_SIM, stdout="Reading package lists...\n")
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertIn("check: the autoremove simulation in ct 101 returned no summary line: FAILED\n", result.stdout)
+        summary = "0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\n"
+        self.lab.respond("pve1", CT_SIM, stdout=self.sim(["lighttpd"], summary=summary))
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertIn("check: the autoremove simulation in ct 101 states 2 package(s) to remove but lists 1: "
+                      "do not trust it: FAILED\n", result.stdout)
+        self.lab.respond("pve1", CT_SIM, exit=255, stderr="ssh: boom\n")
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertIn("check: the autoremove simulation failed in ct 101: FAILED\n", result.stdout)
+
+    def test_container_protects_no_node_package(self):
+        # the Proxmox stack and the node's kernel are not inside a container: no uname -r on the node
+        self.lab.respond("pve1", CT_SIM, stdout=self.sim(["proxmox-ve"]))
+        result = self.lab.run("pve-cleanup", "101", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("uname -r", self.lab.commands("collect"))
 
     def test_without_yes_and_terminal_nothing_runs(self):
         result = self.lab.run("pve-cleanup", "pve1")
