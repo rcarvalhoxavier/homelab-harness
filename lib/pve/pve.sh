@@ -170,20 +170,20 @@ pve_guest_backups() {
 # pve_sim_removals WHERE LABEL SIMULATION: the removals of an apt simulation, read only when the
 # output can be trusted. Fails the check (exit 1) when the simulation has no summary line, or when
 # its "N to remove" differs from its Remv lines (a truncated or garbled output must never read as
-# "nothing to remove"). WHERE places it in the messages ("on pve1", "in ct 101"). Sets
-# PVE_REMOVALS (names, sorted, space-separated) and PVE_REMOVAL_COUNT.
+# "nothing to remove"). WHERE places it in the messages ("on pve1", "in ct 101"); LABEL may be
+# empty. Sets PVE_REMOVALS (names, sorted, space-separated) and PVE_REMOVAL_COUNT.
 pve_sim_removals() {
-  local where="$1" label="$2" sim="$3" list stated
+  local where="$1" name="the ${2:+$2 }simulation" sim="$3" list stated
   PVE_REMOVALS=""
   PVE_REMOVAL_COUNT=0
   grep -Eq "$PVE_APT_SUMMARY_RE" <<< "$sim" ||
-    pve_check_fail "the $label simulation $where returned no summary line"
+    pve_check_fail "$name $where returned no summary line"
   list="$(pve_parse_pkg_removals <<< "$sim" | LC_ALL=C sort)"
   PVE_REMOVAL_COUNT="$(awk 'NF { n++ } END { print n + 0 }' <<< "$list")"
   stated="$(sed -nE 's/^[0-9]+ upgraded, [0-9]+ newly installed, ([0-9]+) to remove and .*/\1/p' <<< "$sim")"
   stated="${stated%%$'\n'*}"
   [[ "$stated" == "$PVE_REMOVAL_COUNT" ]] ||
-    pve_check_fail "the $label simulation $where states $stated package(s) to remove but lists $PVE_REMOVAL_COUNT: do not trust it"
+    pve_check_fail "$name $where states $stated package(s) to remove but lists $PVE_REMOVAL_COUNT: do not trust it"
   PVE_REMOVALS="${list//$'\n'/ }"
 }
 
