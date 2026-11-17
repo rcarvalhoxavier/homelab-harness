@@ -7,7 +7,9 @@ PVE_ENV_NAMES=(PVE_BACKUP_STORAGE PVE_STORAGE_WARN_PCT PVE_BACKUP_MAX_AGE_DAYS
 _PVE_SSHPASS=""
 
 # _pve_env_parse_line LINE: on an assignment, set _PVE_ENV_KEY and _PVE_ENV_VAL and return 0.
-# Mirrors env_values() in lib/wikitools/redact.py; tests/test_pve_env.py keeps them equal.
+# Parses a line as env_assignments() in lib/wikitools/redact.py does; tests/test_pve_env.py
+# keeps them equal. A name assigned twice: pve_env_load keeps the first value, wiki-capture
+# redacts both.
 _pve_env_parse_line() {
   local line="${1%$'\r'}" key val quote
   local comment_re='^[[:space:]]*#'

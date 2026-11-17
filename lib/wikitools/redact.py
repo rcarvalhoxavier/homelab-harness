@@ -552,10 +552,11 @@ NOT_SECRET_NAME_RE = re.compile(
     r"|NAME|URL|DOMAIN|EMAIL|TZ|LANG)$|^(?:LOG|ASSUME)_")
 
 
-def env_values(path: Path | None) -> dict[str, str]:
+def env_assignments(path: Path | None) -> list[tuple[str, str]]:
+    """Every NAME=value line of `path`, in file order, duplicated names included."""
     if path is None or not Path(path).is_file():
-        return {}
-    values = {}
+        return []
+    pairs = []
     for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         if raw.lstrip().startswith("#"):
             continue
@@ -568,14 +569,26 @@ def env_values(path: Path | None) -> dict[str, str]:
             value = value[1:end] if end > 0 else value[1:]
         else:
             value = re.split(r"[ \t]+#", value, maxsplit=1)[0].strip()   # drop ` # comment`
-        values[match.group(1)] = value
+        pairs.append((match.group(1), value))
+    return pairs
+
+
+def env_values(path: Path | None) -> dict[str, str]:
+    """The value of each name; a duplicated name keeps its first value, as lib/pve/env.sh does."""
+    values: dict[str, str] = {}
+    for name, value in env_assignments(path):
+        values.setdefault(name, value)
     return values
 
 
 def load_env_literals(path: Path | None) -> list[str]:
-    """Values (≥ 6 chars) of `.env.local` variables whose names do not mark them public."""
-    return [value for name, value in env_values(path).items()
-            if len(value) >= 6 and not NOT_SECRET_NAME_RE.search(name)]
+    """Values (≥ 6 chars) of `.env.local` variables whose names do not mark them public. Every
+    value of a duplicated name counts: whichever one a tool uses, both are secrets."""
+    literals = []
+    for name, value in env_assignments(path):
+        if len(value) >= 6 and not NOT_SECRET_NAME_RE.search(name) and value not in literals:
+            literals.append(value)
+    return literals
 
 
 def env_public_values(path: Path | None) -> dict[str, str]:

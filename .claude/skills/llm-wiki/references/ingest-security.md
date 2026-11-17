@@ -56,7 +56,8 @@ every future session that reads it.
   `curl -u user:…`, `mysql -p…`, `docker login -p …`, `echo user:… | chpasswd`;
 - every value in `.env.local` except those whose names mark them as a location or a name
   (`*_HOST`, `*_USER`, `*_PORT`, `*_STORAGE`, `*_PATH`, …): the tool says when one of those
-  appears in a capture;
+  appears in a capture. Values shorter than 6 characters are never redacted, because they would
+  match ordinary words: a short PIN or code in `.env.local` is not protected;
 - every regex in `wiki/.capture-patterns`: **shapes and prefixes only** (`my-lab-wifi-psk-\w+`),
   because that file is committed. A literal secret goes in `.env.local`.
 
@@ -68,6 +69,7 @@ the rules are weakest:
 - a secret with no key next to it (a bare token on its own line, a password in free text, a
   Proxmox token secret without its token id);
 - a key name the rules do not know (`wifi_code: …`, a vendor's own format);
+- a `.env.local` value shorter than 6 characters;
 - values in formats the rules do not parse (multi-line JSON strings, binary blobs, base64 of
   anything but a PEM key);
 - anything a warning points at: "random-looking values next to a key" are exactly the

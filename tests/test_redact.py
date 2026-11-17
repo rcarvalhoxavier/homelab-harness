@@ -85,6 +85,26 @@ class LoaderTest(unittest.TestCase):
             self.assertEqual(redact.load_env_literals(Path(tmp) / "missing"), [])
             self.assertEqual(redact.load_env_literals(None), [])
 
+    def test_env_values_shorter_than_six_characters_are_not_redacted(self):
+        # The floor keeps a short value from redacting ordinary words wherever they appear;
+        # .env.local.example and the ingest-security reference say so.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / ".env.local"
+            env.write_text("ALARM_PIN=12345\nWIFI_KEY=abcde\nDOOR_PIN=123456\n")
+            self.assertEqual(redact.load_env_literals(env), ["123456"])
+            self.assertEqual(r("pin 12345 abcde\n", literals=["12345", "abcde"]).text, "pin 12345 abcde\n")
+
+    def test_every_value_of_a_duplicated_name_is_redacted(self):
+        # The toolkit keeps the first assignment and other tools may keep the last: whichever
+        # one is in use, both values are secrets.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / ".env.local"
+            env.write_text("NAS_PASSWORD=firstS3cret\nOTHER=otherS3cret\nNAS_PASSWORD=secondS3cret\n")
+            self.assertEqual(redact.load_env_literals(env), ["firstS3cret", "otherS3cret", "secondS3cret"])
+            self.assertEqual(redact.env_values(env)["NAS_PASSWORD"], "firstS3cret")
+            out = r("old firstS3cret new secondS3cret\n", literals=redact.load_env_literals(env))
+            self.assertEqual(out.text, "old <REDACTED:secret> new <REDACTED:secret>\n")
+
     def test_load_custom_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".capture-patterns"

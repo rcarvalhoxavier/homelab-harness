@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tests import ROOT
 from tests.toolkit import Lab
-from wikitools.redact import env_values
+from wikitools.redact import env_assignments
 
 LOAD = "source lib/pve/log.sh\nsource lib/pve/env.sh\nPVE_ROOT=$PWD\n"
 
@@ -22,6 +22,8 @@ PARITY_CASES = (
     "TRAIL=value   \n"
     "CRLF=crlf\r\n"
     "TAB=a\t# tab comment\n"
+    "DUP=first\n"
+    "DUP=second\n"
     "=novar\n"
     "not an assignment\n"
 )
@@ -37,7 +39,7 @@ class EnvParityTest(unittest.TestCase):
             '  if _pve_env_parse_line "$line"; then printf "%s=%s\\n" "$_PVE_ENV_KEY" "$_PVE_ENV_VAL"; fi\n'
             "done < .env.local\n"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = "".join(f"{k}={v}\n" for k, v in env_values(lab.root / ".env.local").items())
+        expected = "".join(f"{k}={v}\n" for k, v in env_assignments(lab.root / ".env.local"))
         self.assertEqual(result.stdout, expected)
 
 
@@ -75,6 +77,12 @@ class EnvLoadTest(unittest.TestCase):
         result = self.load("PVE_STORAGE_WARN_PCT=90\n", 'echo "$PVE_STORAGE_WARN_PCT"',
                            PVE_STORAGE_WARN_PCT="70")
         self.assertEqual(result.stdout.strip(), "70")
+
+    def test_a_duplicated_name_keeps_its_first_value(self):
+        # wiki-capture redacts both values; the toolkit uses the first, like the environment
+        # winning over the file
+        result = self.load("PVE_STORAGE_WARN_PCT=90\nPVE_STORAGE_WARN_PCT=70\n", 'echo "$PVE_STORAGE_WARN_PCT"')
+        self.assertEqual(result.stdout.strip(), "90", result.stderr)
 
     def test_invalid_values_are_configuration_errors(self):
         for line, name in (("PVE_STORAGE_WARN_PCT=abc", "PVE_STORAGE_WARN_PCT"),
