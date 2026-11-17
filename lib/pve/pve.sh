@@ -99,12 +99,19 @@ pve_guest_status() {
   awk '/^status:/ { print $2 }' <<< "$out"
 }
 
+# pve_listsnapshot_complete: stdin is the output of pct/qm listsnapshot; 0 when it ends in the
+# pseudo-entry row of the current state ("current ... You are here!", after the tree drawing). A
+# snapshot whose name or description holds the word "current" is not that row.
+pve_listsnapshot_complete() {
+  grep -Eq '^[[:space:]`>|-]*current[[:space:]]+You are here!'
+}
+
 # pve_guest_has_snapshot NODE TYPE VMID NAME: 0 = found, 1 = absent, 2 = unreadable (failed read,
 # empty answer, or no "current" line); the stderr of a failed read stays visible.
 pve_guest_has_snapshot() {
   local out
   out="$(pve_collect "$1" "$(pve_cli_of "$2")" listsnapshot "$3")" || return 2
-  grep -q 'current' <<< "$out" || return 2
+  pve_listsnapshot_complete <<< "$out" || return 2
   pve_parse_snapshots <<< "$out" | awk -v want="$4" '$1 == want { found = 1 } END { exit !found }'
 }
 

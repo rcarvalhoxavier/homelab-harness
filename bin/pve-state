@@ -36,7 +36,7 @@ state_guest() {
   pve_indent <<< "$config"
   out="$(pve_collect "$node" "$cli" listsnapshot "$id")" || exit 1
   # a real listing always has a "current" line
-  grep -q 'current' <<< "$out" || pve_die 1 "could not read the snapshots of $type $id: no current line"
+  pve_listsnapshot_complete <<< "$out" || pve_die 1 "could not read the snapshots of $type $id: no current line"
   printf 'snapshots:\n'
   pve_parse_snapshots <<< "$out" | pve_indent
   printf 'volumes:\n'
