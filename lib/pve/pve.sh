@@ -167,27 +167,37 @@ pve_guest_backups() {
   done < <(pve_parse_pvesm_list <<< "$out") | LC_ALL=C sort
 }
 
-# pve_removal_guard NODE LABEL SIMULATION: the removal check before any apt run on a node
-# (pve-update-host, pve-cleanup). Fails the check (exit 1) when the simulation has no summary line,
-# when its "N to remove" differs from its Remv lines, when the running kernel cannot be read, or
-# when it would remove the Proxmox stack (proxmox-ve, pve-manager, qemu-server, pve-container) or
-# a package of the running kernel. Sets PVE_REMOVALS (names, sorted, space-separated) and
-# PVE_REMOVAL_COUNT.
-pve_removal_guard() {
-  local node="$1" label="$2" sim="$3" list stated running
+# pve_sim_removals WHERE LABEL SIMULATION: the removals of an apt simulation, read only when the
+# output can be trusted. Fails the check (exit 1) when the simulation has no summary line, or when
+# its "N to remove" differs from its Remv lines (a truncated or garbled output must never read as
+# "nothing to remove"). WHERE places it in the messages ("on pve1", "in ct 101"). Sets
+# PVE_REMOVALS (names, sorted, space-separated) and PVE_REMOVAL_COUNT.
+pve_sim_removals() {
+  local where="$1" label="$2" sim="$3" list stated
   PVE_REMOVALS=""
   PVE_REMOVAL_COUNT=0
   grep -Eq "$PVE_APT_SUMMARY_RE" <<< "$sim" ||
-    pve_check_fail "the $label simulation on $node returned no summary line"
+    pve_check_fail "the $label simulation $where returned no summary line"
   list="$(pve_parse_pkg_removals <<< "$sim" | LC_ALL=C sort)"
   PVE_REMOVAL_COUNT="$(awk 'NF { n++ } END { print n + 0 }' <<< "$list")"
   stated="$(sed -nE 's/^[0-9]+ upgraded, [0-9]+ newly installed, ([0-9]+) to remove and .*/\1/p' <<< "$sim")"
   stated="${stated%%$'\n'*}"
   [[ "$stated" == "$PVE_REMOVAL_COUNT" ]] ||
-    pve_check_fail "the $label simulation on $node states $stated package(s) to remove but lists $PVE_REMOVAL_COUNT: do not trust it"
+    pve_check_fail "the $label simulation $where states $stated package(s) to remove but lists $PVE_REMOVAL_COUNT: do not trust it"
+  PVE_REMOVALS="${list//$'\n'/ }"
+}
+
+# pve_removal_guard NODE LABEL SIMULATION: the removal check before any apt run on a node
+# (pve-update-host, pve-cleanup). Fails the check (exit 1) when pve_sim_removals does, when the
+# running kernel cannot be read, or when the simulation would remove the Proxmox stack
+# (proxmox-ve, pve-manager, qemu-server, pve-container) or a package of the running kernel. Sets
+# PVE_REMOVALS (names, sorted, space-separated) and PVE_REMOVAL_COUNT.
+pve_removal_guard() {
+  local node="$1" label="$2" sim="$3" list running
+  pve_sim_removals "on $node" "$label" "$sim"
   running="$(pve_collect "$node" uname -r)" || pve_check_fail "cannot read the running kernel of $node"
   [[ -n "$running" ]] || pve_check_fail "cannot read the running kernel of $node: empty answer"
-  PVE_REMOVALS="${list//$'\n'/ }"
+  list="${PVE_REMOVALS// /$'\n'}"
   # membership tests on a variable: no early-exiting reader in a pipeline (SIGPIPE under pipefail)
   case $'\n'"$list"$'\n' in
     *$'\n'proxmox-ve$'\n'*|*$'\n'pve-manager$'\n'*|*$'\n'qemu-server$'\n'*|*$'\n'pve-container$'\n'*)

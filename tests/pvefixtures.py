@@ -346,6 +346,55 @@ Calculating upgrade...
 0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
 """
 
+# Simulations inside a Debian container (pct exec ... env LC_ALL=C apt-get -s ...). The default
+# answers remove nothing; the *_REMOVES ones remove a service that was installed as a dependency.
+CT_APT_SIM = """\
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages will be upgraded:
+  libssl3 openssl
+2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Inst libssl3 [3.0.15-1~deb12u1] (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+Inst openssl [3.0.15-1~deb12u1] (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+Conf libssl3 (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+Conf openssl (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+"""
+
+CT_APT_SIM_REMOVES = """\
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages will be REMOVED:
+  lighttpd
+The following packages will be upgraded:
+  openssl
+1 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.
+Remv lighttpd [1.4.69-1]
+Inst openssl [3.0.15-1~deb12u1] (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+Conf openssl (3.0.16-1~deb12u1 Debian-Security:12/stable-security [amd64])
+"""
+
+CT_AUTOREMOVE_SIM_NONE = """\
+Reading package lists...
+Building dependency tree...
+Reading state information...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+"""
+
+CT_AUTOREMOVE_SIM_REMOVES = """\
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following packages will be REMOVED:
+  lighttpd libldap-2.5-0
+0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.
+Remv lighttpd [1.4.69-1]
+Remv libldap-2.5-0 [2.5.13+dfsg-5]
+"""
+
 
 # what `mktemp /tmp/homelab-put.XXXXXXXX` prints on a node (pve_admin_put's remote temporary file)
 PUT_TMP = "/tmp/homelab-put.Ab3dE5gH"
@@ -461,6 +510,9 @@ def answers(node: str, version: str = "8") -> dict:
             table[f"{cli} status {vmid}"] = ok(f"status: {status}\n")
             table[f"{cli} config {vmid}"] = ok(CONFIGS[vmid])
             table[f"{cli} listsnapshot {vmid}"] = ok(SNAPSHOTS[vmid])
+            if kind == "ct":   # simulations inside the container go through the admin alias
+                table[f"pct exec {vmid} -- env LC_ALL=C apt-get -s dist-upgrade"] = ok(CT_APT_SIM)
+                table[f"pct exec {vmid} -- env LC_ALL=C apt-get -s autoremove"] = ok(CT_AUTOREMOVE_SIM_NONE)
     return table
 
 
