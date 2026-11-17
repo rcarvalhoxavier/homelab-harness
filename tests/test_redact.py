@@ -197,5 +197,167 @@ class RedactionRegressionTest(unittest.TestCase):
         self.assertEqual(r(text, exposure="public").text, text)
 
 
+# Invented values, built in pieces like the token-shaped strings above.
+UUID = "0a1b2c3d-" + "4e5f-4a6b-8c7d-" + "9e0f1a2b3c4d"
+BCRYPT = "$2y$10$" + "abcdefghijklmnopqrstuv" + "wxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0"
+
+
+class SecretShapeTest(unittest.TestCase):
+    """Secret shapes from homelab configuration files and commands, each with lines that look
+    alike and must stay: evidence is useless if ordinary lines are destroyed."""
+
+    def check(self, cases, untouched):
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                out = r(text)
+                self.assertEqual(out.text, expected)
+                self.assertGreater(out.counts["secret"], 0)
+        for text in untouched:
+            with self.subTest(untouched=text):
+                out = r(text)
+                self.assertEqual(out.text, text)
+                self.assertEqual(out.counts["secret"], 0)
+
+    def test_proxmox_api_token_secret(self):
+        table = ("│ full-tokenid │ root@pam!monitor │\n"
+                 "│ info         │ {\"privsep\":1}   │\n"
+                 f"│ value        │ {UUID} │\n")
+        json = '{"full-tokenid":"root@pam!monitor","info":{"privsep":1},"value":"' + UUID + '"}\n'
+        yaml = f"---\nfull-tokenid: root@pam!monitor\ninfo:\n   privsep: '1'\nvalue: {UUID}\n"
+        self.check({
+            table: table.replace(UUID, "<REDACTED:token>"),
+            json: json.replace(UUID, "<REDACTED:token>"),
+            yaml: yaml.replace(UUID, "<REDACTED:token>"),
+            f"root@pam!monitor {UUID}\n": "root@pam!monitor <REDACTED:token>\n",
+            f"backup@pve!pbs-sync {UUID}\n": "backup@pve!pbs-sync <REDACTED:token>\n",
+            f"Authorization: PVEAPIToken=root@pam!monitor={UUID}\n": "Authorization: PVEAPIToken=<REDACTED:secret>\n",
+        }, [
+            f"smbios1: uuid={UUID}\n",
+            f"UUID={UUID} / ext4 defaults 0 1\n",
+            f"vmgenid: {UUID}\n",
+            f"│ value        │ {UUID} │\n",               # no token id in the text
+            '{"id":"sensor.cpu","value":"' + UUID + '"}\n',
+            "│ full-tokenid │ root@pam!monitor │\n",
+        ])
+
+    def test_url_credentials_with_an_empty_user_name(self):
+        self.check({
+            "redis://:Hunter2pass@cache:6379/0\n": "redis://:<REDACTED:password>@cache:6379/0\n",
+            "REDIS_URL=redis://:Hunter2pass@cache\n": "REDIS_URL=redis://:<REDACTED:password>@cache\n",
+        }, ["redis://cache:6379/0\n", "redis://cache:6379\n", "https://host:8443/@user\n"])
+
+    def test_cloud_init_password(self):
+        self.check({
+            "qm set 101 --cipassword Hunter2pass\n": "qm set 101 --cipassword <REDACTED:password>\n",
+            "qm set 101 --cipassword=Hunter2pass\n": "qm set 101 --cipassword=<REDACTED:secret>\n",
+            "qm set 101 --cipassword 'two words'\n": "qm set 101 --cipassword '<REDACTED:password>'\n",
+        }, ["qm set 101 --ciuser admin\n", "cipassword: **********\n",
+            "qm set 101 --ipconfig0 ip=dhcp\n"])
+
+    def test_snmp_community_in_snmpd_conf(self):
+        self.check({
+            "com2sec readonly default snmpComm13\n": "com2sec readonly default <REDACTED:secret>\n",
+            "com2sec6 -Cn ctx local ::1 snmpComm13\n": "com2sec6 -Cn ctx local ::1 <REDACTED:secret>\n",
+        }, ["#       sec.name  source          community\n", "group MyROGroup v2c readonly\n"])
+
+    def test_snmp_community_and_passphrases_on_the_command_line(self):
+        self.check({
+            "snmpwalk -v2c -c snmpComm13 10.0.0.2\n": "snmpwalk -v2c -c <REDACTED:secret> 10.0.0.2\n",
+            "snmpget -v2c -csnmpComm13 nas sysUpTime.0\n": "snmpget -v2c -c<REDACTED:secret> nas sysUpTime.0\n",
+            "snmpbulkwalk -v2c -c 'snmpComm13' sw1 ifTable\n": "snmpbulkwalk -v2c -c '<REDACTED:secret>' sw1 ifTable\n",
+            "snmpset -v1 -c snmpComm13 sw1 sysName.0 s lab\n": "snmpset -v1 -c <REDACTED:secret> sw1 sysName.0 s lab\n",
+            "snmpwalk -v3 -l authPriv -u mon -a SHA -A authPass99 -x AES -X privPass99 nas\n":
+                "snmpwalk -v3 -l authPriv -u mon -a SHA -A <REDACTED:secret> -x AES -X <REDACTED:secret> nas\n",
+        }, ["ssh -c aes256-ctr root@pve1\n", "ping -c 3 nas\n", "tar -czf backup.tgz etc\n",
+            "tar -c -f backup.tar etc\n", "snmpwalk -v2c -Cc nas\n"])
+
+    def test_wpa_psk_in_network_interfaces(self):
+        self.check({
+            "    wpa-psk wifiSecret99\n": "    wpa-psk <REDACTED:secret>\n",
+            '    wpa-psk "wifi secret 99"\n': '    wpa-psk "<REDACTED:secret>"\n',
+            "wpa_passphrase=wifiSecret99\n": "wpa_passphrase=<REDACTED:secret>\n",
+            '  psk="wifiSecret99"\n': '  psk="<REDACTED:secret>"\n',
+        }, ["    wpa-ssid HomeNet\n", "    wpa-key-mgmt WPA-PSK\n",
+            "    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf\n", "key_mgmt=WPA-PSK\n"])
+
+    def test_space_separated_password(self):
+        self.check({
+            "password hunter2abc\n": "password <REDACTED:secret>\n",
+            "  password    hunter2abc\n": "  password    <REDACTED:secret>\n",
+            'password "two words 9"\n': 'password "<REDACTED:secret>"\n',
+        }, ["PasswordAuthentication no\n", "PermitEmptyPasswords no\n",
+            "password requisite pam_pwquality.so retry=3\n",
+            "password [success=1 default=ignore] pam_unix.so obscure yescrypt\n",
+            "password required\n", "password changed\n",
+            "The password is rotated yearly.\n", "password vaults.\n", 'passwordeval "gpg -q -d ~/.msmtp-pass.gpg"\n',
+            "passwd root\n"])
+
+    def test_netrc_password(self):
+        self.check({
+            "machine nas.lab login admin password hunter2abc\n":
+                "machine nas.lab login admin password <REDACTED:secret>\n",
+            "default login anonymous password hunter2abc\n":
+                "default login anonymous password <REDACTED:secret>\n",
+            "machine nas.lab\n  login admin\n  password hunter2abc\n":
+                "machine nas.lab\n  login admin\n  password <REDACTED:secret>\n",
+            "  login admin password hunter2abc\n": "  login admin password <REDACTED:secret>\n",
+        }, ["machine nas.lab login admin\n", "The default password policy applies.\n"])
+
+    def test_postfix_sasl_passwd(self):
+        self.check({
+            "[smtp.example.com]:587 me@example.com:hunter2abc\n":
+                "[smtp.example.com]:587 me@example.com:<REDACTED:secret>\n",
+            "smtp.example.com relay-user:hunter2abc\n": "smtp.example.com relay-user:<REDACTED:secret>\n",
+            "example.com:587 relay-user:hunter2abc\n": "example.com:587 relay-user:<REDACTED:secret>\n",
+        }, ["FROM debian:bookworm\n", "image: nginx:1.25\n", "relayhost = [smtp.example.com]:587\n",
+            "10.0.0.5 nas.lab.example\n", "docker.io/library/nginx:1.25 up 3 days\n",
+            ".I http://www.sane-project.org/\n", "backup.example.com nas:/export/backup\n",
+            "    slave.pcm plug:dmixer\n", '    slave.pcm "plughw:0,0"\n'])
+
+    def test_chpasswd_input(self):
+        self.check({
+            "echo admin:hunter2abc | chpasswd\n": "echo admin:<REDACTED:password> | chpasswd\n",
+            "echo 'root:hunter2abc' | sudo chpasswd\n": "echo 'root:<REDACTED:password>' | sudo chpasswd\n",
+            "chpasswd <<< 'admin:hunter2abc'\n": "chpasswd <<< 'admin:<REDACTED:password>'\n",
+        }, ["echo done | tee -a log\n", "chpasswd --help\n", "echo 10:30 | logger\n"])
+
+    def test_age_secret_key(self):
+        key = "AGE-SECRET-KEY-1" + "QWERTYUPASDFGHJKLZXCVNM023456789" + "QWERTYUPASDFGHJKLZXCVN"
+        recipient = "age1" + "ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+        self.check({
+            f"{key}\n": "<REDACTED:private-key>\n",
+            f"# public key: {recipient}\n{key}\n": f"# public key: {recipient}\n<REDACTED:private-key>\n",
+        }, [f"# public key: {recipient}\n", f"recipients: {recipient}\n"])
+
+    def test_bcrypt_hash_outside_htpasswd(self):
+        doubled = BCRYPT.replace("$", "$$")
+        self.check({
+            f"  hash: {BCRYPT}\n": "  hash: <REDACTED:password-hash>\n",
+            f"traefik.http.middlewares.auth.basicauth.users=admin:{doubled}\n":
+                "traefik.http.middlewares.auth.basicauth.users=admin:<REDACTED:password-hash>\n",
+            f'{{"hash": "{BCRYPT.replace("$2y", "$2b")}"}}\n': '{"hash": "<REDACTED:password-hash>"}\n',
+        }, ["echo $2\n", "awk '{print $2}' file\n", "it costs $2 per month\n", "$2a is a label\n"])
+
+    def test_hex_or_random_value_of_a_key_named_key(self):
+        self.check({
+            "MEILI_MASTER_KEY=0123456789abcdef0123456789abcdef\n": "MEILI_MASTER_KEY=<REDACTED:secret>\n",
+            "ENCRYPTION_KEY: 0123456789ABCDEF0123456789ABCDEF\n": "ENCRYPTION_KEY: <REDACTED:secret>\n",
+            'MEILI_MASTER_KEY="aB3dE5fG7hJ9kL1mN2pQ4rS6"\n': 'MEILI_MASTER_KEY="<REDACTED:secret>"\n',
+            "  app-key: aB3dE5fG7hJ9kL1mN2pQ4rS6\n": "  app-key: <REDACTED:secret>\n",
+        }, ["SSH_KEY=/root/.ssh/id_ed25519\n", "SSH_KEY=/home/Admin2/.ssh/id_ed25519\n",
+            "SORT_KEY=name\n", "GPG_KEY=0D96DF4D4110E5C43FBFB17F2D347EA6AA65421D\n",
+            "PUBLIC_KEY=0123456789abcdef0123456789abcdef\n", "CACHE_KEY=short\n",
+            "DB_KEY_ID=0123456789abcdef0123\n", "primary_key: id\n"])
+
+    def test_chat_webhook_urls(self):
+        slack = "https://hooks.slack.com/services/" + "T0FAKE000/B0FAKE000/" + "aB3dE5fG7hJ9kL1mN2pQ4rS6"
+        discord = ("https://discord.com/api/webhooks/" + "123456789012345678/"
+                   + "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY_-z")
+        self.check({
+            f"SLACK_WEBHOOK_URL={slack}\n": "SLACK_WEBHOOK_URL=https://hooks.slack.com/services/<REDACTED:token>\n",
+            f"url: {discord}\n": "url: https://discord.com/api/webhooks/123456789012345678/<REDACTED:token>\n",
+        }, ["see https://hooks.slack.com/ for the docs\n", "https://discord.com/channels/123/456\n"])
+
+
 if __name__ == "__main__":
     unittest.main()

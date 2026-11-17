@@ -31,7 +31,8 @@ NSSWITCH_RE = re.compile(r"^(?:files|compat|systemd|sss|ldap|nis|db|winbind)\b")
 KNOWN_WORDS = {"required", "optional", "changed", "rotated", "unset", "empty", "stored", "redacted",
                "hidden", "default", "disabled", "enabled", "unknown", "expired", "missing", "same",
                "see", "set", "configured", "generated", "random", "encrypted", "hashed", "example",
-               "placeholder", "elsewhere", "vault"}
+               "placeholder", "elsewhere", "vault", "incorrect", "invalid", "accepted", "updated",
+               "reset", "failed", "denied", "locked", "ok"}
 SECRET_SYMBOL_RE = re.compile(r"[\d!@#$%^&*+=?~]")
 VALUE_GROUPS = ("dq", "sq", "bare")
 
@@ -182,7 +183,8 @@ KNOWN_TOKEN = Rule(
 URL_CREDENTIALS = Rule(
     "url-credentials", "secret",
     # The password runs to the last "@" before the host, so "@" and "/" inside it are covered.
-    re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@<>]+:(?P<value>\S+?)@(?=[^\s@/:]+(?:[:/?#\s'\")]|$))",
+    # The user name may be empty, as in redis://:password@host.
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@<>]*:(?P<value>\S+?)@(?=[^\s@/:]+(?:[:/?#\s'\")]|$))",
                re.IGNORECASE | re.MULTILINE),
     group="value", marker="<REDACTED:password>", skip=_url_password_skip)
 URL_TOKEN_USER = Rule(
@@ -245,7 +247,7 @@ CISCO_SECRET = Rule(
     group="bare", marker="<REDACTED:secret>", skip=_value_skip, prose_safe=False)
 CLI_PASSWORD = Rule(
     "cli-password", "secret",
-    re.compile(r"(?i)(?:\bsshpass[ \t]+-p[ \t]*|(?<![\w-])--pass(?:word|wd)?[ \t]+)"
+    re.compile(r"(?i)(?:\bsshpass[ \t]+-p[ \t]*|(?<![\w-])--(?:ci)?pass(?:word|wd)?[ \t]+)"
                r"(?:" + _QUOTED + r"|(?P<bare>[^\s\"']+))"),
     group=VALUE_GROUPS, marker="<REDACTED:password>", skip=_value_skip, prose_safe=False)
 CLI_USER = Rule(
@@ -303,6 +305,132 @@ PROSE_KEY_VALUE = Rule(
     skip=lambda m: (not secret_key(m.group("key")) or _pass_status(m)
                     or not looks_secret(_span(m, VALUE_GROUPS)[1])))
 
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# A Proxmox API token secret is a bare UUID. A UUID alone is not a secret (a VM's smbios1
+# uuid, an fstab UUID=, a vmgenid), so it is redacted only next to a token id,
+# user@realm!tokenid: on one line in /etc/pve/priv/token.cfg, or after "=" in a header.
+PVE_TOKEN = Rule(
+    "pve-token", "secret",
+    re.compile(r"(?<![\w.@!-])[\w.-]+@[\w.-]+![A-Za-z][\w.-]*(?:[ \t]+|=)(?P<value>" + _UUID + r")(?![\w-])"),
+    group="value", marker="<REDACTED:token>")
+# `pveum user token add` prints the secret as the `value` row of a table, or a "value" key in
+# JSON or YAML, next to the `full-tokenid`; the secret is redacted only when that id is there.
+PVE_TOKEN_VALUE = Rule(
+    "pve-token", "secret",
+    re.compile(r"(?:^[ \t]*[│|][ \t]*value[ \t]*[│|][ \t]*|\"value\"[ \t]*:[ \t]*\"|^[ \t]*value[ \t]*:[ \t]*)"
+               r"(?P<value>" + _UUID + r")(?![\w-])", re.MULTILINE),
+    group="value", marker="<REDACTED:token>", skip=lambda m: "full-tokenid" not in m.string)
+
+
+def _after_snmp_command(match: re.Match) -> bool:
+    """True when the flag follows a net-snmp command on the same line (snmpwalk, snmpget...)."""
+    text = match.string
+    before = text[text.rfind("\n", 0, match.start()) + 1:match.start()]
+    return bool(re.search(r"\bsnmp(?:bulk)?(?:walk|get(?:next)?|set|table|trap|inform|df|status|netstat"
+                          r"|delta|usm|vacm)\b", before))
+
+
+# net-snmp tools take the community with -c and the SNMPv3 passphrases with -A and -X. The
+# same flags mean other things elsewhere (ssh -c cipher, ping -c count, tar -c), so the value
+# is redacted only after an SNMP command.
+SNMP_CLI = Rule(
+    "snmp-community", "secret",
+    re.compile(r"(?<=[ \t])-[cAX][ \t]*(?:" + _QUOTED + r"|(?P<bare>[^\s\"'-]\S*))"),
+    group=VALUE_GROUPS, marker="<REDACTED:secret>",
+    skip=lambda m: not _after_snmp_command(m) or _value_skip(m), prose_safe=False)
+# snmpd.conf: com2sec [-Cn CONTEXT] NAME SOURCE COMMUNITY
+COM2SEC = Rule(
+    "snmp-community", "secret",
+    re.compile(r"(?<![\w-])com2sec6?(?:[ \t]+-Cn[ \t]+\S+)?[ \t]+\S+[ \t]+\S+[ \t]+(?P<bare>\S+)"),
+    group="bare", marker="<REDACTED:secret>", skip=_value_skip, prose_safe=False)
+# Debian /etc/network/interfaces: wpa-psk VALUE (the rest of the line, or a quoted string).
+WPA_PSK = Rule(
+    "key-value", "secret",
+    re.compile(r"^[ \t]*wpa-(?:psk|passphrase|password)[ \t]+(?:" + _QUOTED + r"|(?P<bare>[^\s\"'][^\r\n]*?))"
+               r"(?=[ \t]*\r?$)", re.MULTILINE),
+    group=VALUE_GROUPS, marker="<REDACTED:secret>", skip=_value_skip, prose_safe=False)
+
+
+def _spaced_password_skip(match: re.Match) -> bool:
+    """A status word ("password changed") or a word that ends a sentence, as when wrapped
+    prose puts "password" first on a line ("password vaults."), is not a password."""
+    value = _span(match, VALUE_GROUPS)[1]
+    return (_value_skip(match) or value.lower() in KNOWN_WORDS
+            or bool(re.fullmatch(r"[A-Za-z]+[.,;:!?)]", value)))
+
+
+# msmtprc and a multi-line .netrc: `password VALUE` alone on its line. A PAM line
+# (`password requisite pam_pwquality.so`) has more words after it and stays.
+SPACED_PASSWORD = Rule(
+    "key-value", "secret",
+    re.compile(r"^[ \t]*password[ \t]+(?:" + _QUOTED + r"|(?P<bare>[^\s\"']\S*))(?=[ \t]*\r?$)", re.MULTILINE),
+    group=VALUE_GROUPS, marker="<REDACTED:secret>", skip=_spaced_password_skip, prose_safe=False)
+# .netrc on one line: machine HOST login USER password VALUE (or default ..., login ...).
+NETRC = Rule(
+    "key-value", "secret",
+    re.compile(r"^[ \t]*(?:machine[ \t]+\S+|default|login[ \t]+\S+|account[ \t]+\S+)"
+               r"(?:[ \t]+(?:login|account|port|machine)[ \t]+\S+)*[ \t]+password[ \t]+(?P<bare>\S+)",
+               re.MULTILINE),
+    group="bare", marker="<REDACTED:secret>", skip=_spaced_password_skip, prose_safe=False)
+# Postfix sasl_passwd: [relay.host]:port user:password, alone on its line. The relay is in
+# brackets, has a port, or is a name with two dots (smtp.example.com), so `FROM debian:bookworm`,
+# `image nginx:1.25` and ALSA's `slave.pcm plug:dmixer` stay; a value that starts with "/" is a
+# URL or a path (`.I http://…`, `nas.lab.lan nas:/export`), not a password.
+SASL_PASSWD = Rule(
+    "sasl-password", "secret",
+    re.compile(r"^[ \t]*(?:\[[^\]\s]+\](?::\d+)?|[\w+@-]+(?:\.[\w-]+)+:\d+|[\w+@-]+(?:\.[\w-]+){2,})"
+               r"[ \t]+[^\s:\"']+:(?P<bare>[^\s/]\S*)"
+               r"(?=[ \t]*\r?$)",
+               re.MULTILINE),
+    group="bare", marker="<REDACTED:secret>", skip=_value_skip, prose_safe=False)
+# echo user:password | chpasswd, and chpasswd <<< 'user:password'
+CHPASSWD = Rule(
+    "cli-password", "secret",
+    re.compile(r"\becho[ \t]+(?:-[a-zA-Z]+[ \t]+)*[\"']?[^\s:\"']+:(?P<bare>[^\s\"']+)[\"']?[ \t]*\|[ \t]*"
+               r"(?:sudo[ \t]+)?chpasswd\b"
+               r"|\bchpasswd\b[^\r\n<]*<<<[ \t]*[\"']?[^\s:\"']+:(?P<here>[^\s\"']+)"),
+    group=("bare", "here"), marker="<REDACTED:password>")
+# An age private key; age1... recipients are public keys and stay.
+AGE_KEY = Rule(
+    "private-key", "secret",
+    re.compile(r"\bAGE-SECRET-KEY-1[0-9A-Z]{50,}\b"),
+    marker="<REDACTED:private-key>")
+# A bcrypt hash anywhere, also with the "$$" that docker compose needs for a literal "$".
+BCRYPT = Rule(
+    "password-hash", "secret",
+    re.compile(r"(?<![\w$])\$\$?2[aby]\$\$?\d\d\$\$?[./A-Za-z0-9]{53}(?![./A-Za-z0-9])"),
+    marker="<REDACTED:password-hash>")
+
+
+def _named_key_skip(match: re.Match) -> bool:
+    """A *_KEY value is a secret when it is all hex or mixes upper case, lower case and digits;
+    public keys, GPG fingerprints and paths stay."""
+    if re.search(r"(?i)(?:public|pub|gpg|pgp)[_-]key[\"'`]?$", match.group("key")):
+        return True
+    value = _span(match, VALUE_GROUPS)[1]
+    if value.startswith(("/", ".", "~")):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]+", value):
+        return False
+    return not (re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) and re.search(r"\d", value))
+
+
+_KEYISH = r"[A-Za-z0-9+/_=.-]{16,}"
+# MEILI_MASTER_KEY=..., ENCRYPTION_KEY: ...: a key named only *_KEY, with a long hex or
+# random-looking value.
+NAMED_KEY = Rule(
+    "key-value", "secret",
+    re.compile(r"(?<![A-Za-z0-9_.-])(?P<key>[\"'`]?[A-Za-z0-9_.-]*[_-]key[\"'`]?)" + _SEP
+               + r"(?:\"(?P<dq>" + _KEYISH + r")\"|'(?P<sq>" + _KEYISH + r")'|(?P<bare>" + _KEYISH
+               + r"))(?![A-Za-z0-9+/_=.-])", re.IGNORECASE),
+    group=VALUE_GROUPS, marker="<REDACTED:secret>", skip=_named_key_skip, prose_safe=False)
+# Slack and Discord incoming webhooks: the URL itself is the credential.
+WEBHOOK_URL = Rule(
+    "known-token", "secret",
+    re.compile(r"\bhttps?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/"
+               r"|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/\d+/)(?P<value>[A-Za-z0-9/_-]{10,})"),
+    group="value", marker="<REDACTED:token>")
+
 MAC = Rule(
     "mac", "mac",
     re.compile(r"(?<![\w:-])[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}(?![\w:-])"),
@@ -333,7 +461,8 @@ SECRET_RULES = (PRIVATE_KEY, PUTTY_KEY, BASE64_PEM, KNOWN_TOKEN, URL_CREDENTIALS
                 TELEGRAM, QUERY_SECRET, BEARER, BASIC_AUTH, JWT, SHADOW_HASH, HTPASSWD, XML_SECRET,
                 UCI_OPTION, UCI_SHOW, SNMP_COMMUNITY, CISCO_SECRET, CLI_PASSWORD, CLI_USER,
                 MYSQL_PASSWORD, REGISTRY_LOGIN, YAML_BLOCK, YAML_NEXT_LINE, KEY_VALUE_LINE,
-                KEY_VALUE, TABLE_KEY_VALUE)
+                KEY_VALUE, TABLE_KEY_VALUE, PVE_TOKEN, PVE_TOKEN_VALUE, SNMP_CLI, COM2SEC, WPA_PSK,
+                SPACED_PASSWORD, NETRC, SASL_PASSWD, CHPASSWD, AGE_KEY, BCRYPT, NAMED_KEY, WEBHOOK_URL)
 EXPOSURE_RULES = (MAC, MAC_DOTTED, MAC_BARE, IPV4, IPV6, HOSTNAME)
 BUCKETS = ("secret", "ip", "mac", "host")
 
