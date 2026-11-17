@@ -139,6 +139,12 @@ pve_require_snapshot_capable() {
     [[ "$value" == /* && "$value" != *media=cdrom* ]] || continue
     pve_check_fail "$key of $type $id is a passthrough device (${value%%,*}), which cannot be snapshotted"
   done <<< "$config"
+  # A container mount point whose volume starts with / (a bind mount or a device mount) is not a
+  # storage volume: pve_parse_config_volumes skips it, but Proxmox refuses to snapshot the container.
+  while IFS=': ' read -r key value; do
+    [[ "$key" =~ ^mp[0-9]+$ && "$value" == /* ]] || continue
+    pve_check_fail "$key of $type $id mounts the host path ${value%%,*}, which Proxmox cannot snapshot"
+  done <<< "$config"
   while read -r key storage volume _; do
     [[ -n "$key" && "$key" != unused* ]] || continue
     stype="$(pve_parse_pvesm_status <<< "$status" | awk -v s="$storage" '$1 == s { print $2 }')"

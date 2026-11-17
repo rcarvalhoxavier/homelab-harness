@@ -78,5 +78,46 @@ class CurrentRowTest(unittest.TestCase):
                 self.assertIn("check: snapshot name new-one is unused: ok", result.stdout)
 
 
+class BindMountTest(unittest.TestCase):
+    """Proxmox refuses to snapshot a container with a mount point that is not a storage volume."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.addCleanup(self.lab.close)
+        fx.load(self.lab)
+
+    def with_mount_point(self, line):
+        self.lab.respond("pve1", "pct config 101", stdout=fx.CONFIGS["101"] + line)
+
+    def test_a_bind_mount_or_a_device_mount_blocks_the_snapshot(self):
+        for line, path in (("mp0: /mnt/data,mp=/data\n", "/mnt/data"),
+                           ("mp1: /dev/sdb1,mp=/data\n", "/dev/sdb1")):
+            with self.subTest(line=line):
+                self.with_mount_point(line)
+                result = self.lab.run("pve-snapshot", "101", "before-x", "--yes")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                key = line.split(":")[0]
+                self.assertIn(f"check: {key} of ct 101 mounts the host path {path}, "
+                              "which Proxmox cannot snapshot: FAILED\n", result.stdout)
+                self.assertEqual(self.lab.commands("admin"), [])
+
+    def test_the_same_check_stops_a_snapshot_before_an_update(self):
+        self.with_mount_point("mp0: /mnt/data,mp=/data\n")
+        result = self.lab.run("pve-update-ct", "101", "--snapshot", "--dry-run")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("mp0 of ct 101", result.stdout + result.stderr)
+        self.assertEqual(self.lab.commands("admin"), [])
+
+    def test_a_mount_point_on_a_storage_volume_passes(self):
+        self.with_mount_point("mp0: local-lvm:vm-101-disk-1,mp=/data,size=8G\n")
+        result = self.lab.run("pve-snapshot", "101", "before-x", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check: every disk of ct 101 supports snapshots: ok", result.stdout)
+
+    def test_a_container_with_only_a_rootfs_passes(self):
+        result = self.lab.run("pve-snapshot", "101", "before-x", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
