@@ -32,7 +32,9 @@ checked: in a Debian 13 container, apt 3.0.3 prints the same summary line, `The 
 will be upgraded:` and `Inst`/`Conf` lines as apt 2 (only `Reading state information...` is
 missing, and the toolkit does not read it); `Remv` lines were not observed. If apt's output
 differs, `pve-update-host`, `pve-update-ct` and `pve-cleanup` fail closed with "no summary line"
-before changing anything.
+before changing anything. The parsers read English output: every ssh call sets `LC_ALL=C` and
+sends it (`-o SendEnv=LC_ALL`), which a host whose sshd accepts `LC_*` honors; the dispatcher fixes
+the locale on its own. Without either, a non-English locale on the host makes them fail closed.
 
 ## Setup
 

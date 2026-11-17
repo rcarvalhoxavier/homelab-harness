@@ -62,7 +62,7 @@ def main():
     info = scenario["aliases"].get(alias, {"role": "unknown"})
     record = {"tool": "ssh", "alias": alias, "role": info["role"], "node": info.get("node"),
               "options": options, "command": command, "argv": command.split(" "),
-              "sshpass": "SSHPASS" in os.environ, "refused": False, "unexpected": False}
+              "sshpass": "SSHPASS" in os.environ, "lc_all": os.environ.get("LC_ALL"), "refused": False, "unexpected": False}
 
     def finish(code, out="", err=""):
         with open(scenario["log"], "a", encoding="utf-8") as handle:

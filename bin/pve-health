@@ -153,6 +153,9 @@ health_node() {
         "$(pve_gib "$mem_total")" "$(pve_gib "$mem_used")" "$(pve_gib "$swap_total")" "$(pve_gib "$swap_used")"
     else
       finding CRIT "could not read memory on $node"
+      # the parser expects English output ("Mem:"); the dispatcher fixes the locale, a plain ssh key does not
+      grep -q '^Mem:' <<< "$PVE_READ_OUT" ||
+        log_warn "the answer of free on $node has no Mem: line: a non-English locale on the host is a possible cause"
     fi
   fi
   if pve_must_read rootfs df -P -B1 /; then
