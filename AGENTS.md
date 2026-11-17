@@ -40,9 +40,9 @@ and follow it.
 
 **Ownership rule.** Framework files arrive from upstream through `git merge upstream/main`. Do not
 edit them to customize an installation; put customizations in `.claude/rules/local.md`,
-`wiki/AGENTS.md`, `local/`, a new skill directory under `.claude/skills/`, or
-`.claude/settings.local.json`. Upstream never ships `wiki/`, `local/`, `.claude/rules/local.md` or
-`.env.local`.
+`wiki/AGENTS.md`, `inventory/`, `local/`, a new skill directory under `.claude/skills/`, or
+`.claude/settings.local.json`. Upstream never ships `wiki/`, `inventory/`, `local/`,
+`.claude/rules/local.md` or `.env.local`.
 
 ## Safety rules
 
@@ -51,7 +51,8 @@ edit them to customize an installation; put customizations in `.claude/rules/loc
 - Proxmox toolkit: run a changing tool (`bin/pve-snapshot`, `pve-backup`, `pve-update-*`,
   `pve-cleanup`, `pve-move-disk`, `pve-repo-setup`, `pve-collect-install`) with `--dry-run`
   first; pass `--yes` only after the user confirmed that exact command. Never pre-approve a
-  changing tool or an admin SSH alias. `bin/pve-state` is the collector for a guest or a node.
+  changing tool, `bin/pve-selftest` (it can use the admin alias and runs `local/selftest.d/`) or
+  an admin SSH alias. `bin/pve-state` is the collector for a guest or a node.
 - SSH must be key-based and non-interactive (`BatchMode yes`); see `docs/ssh-access.md`. If a
   command would prompt for a password, stop and tell the user instead of retrying.
 - Never write secrets into the wiki, a commit or a reply. Evidence goes through
