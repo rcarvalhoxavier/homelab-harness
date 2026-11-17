@@ -119,5 +119,37 @@ class BindMountTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class AuditFileNameTest(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab()
+        self.addCleanup(self.lab.close)
+
+    def run_at_fixed_time(self, message):
+        # `date` answers one fixed instant, so every run starts in the same second
+        return self.lab.bash("date() { case \"$1\" in +%Y-%m-%d_%H%M%S) echo 2026-06-30_231500 ;;"
+                             " *) command date \"$@\" ;; esac; }\n"
+                             f"pve_audit_start demo\nlog_info {message}")
+
+    def test_two_runs_in_the_same_second_get_two_files(self):
+        for message in ("first-run", "second-run"):
+            self.assertEqual(self.run_at_fixed_time(message).returncode, 0)
+        files = sorted((self.lab.base / "logs").glob("*.log"))
+        self.assertEqual(len(files), 2, files)
+        texts = [path.read_text() for path in files]
+        self.assertEqual([("first-run" in t, "second-run" in t) for t in texts], [(True, False), (False, True)])
+        for path in files:
+            self.assertTrue(path.name.startswith("2026-06-30_231500_demo"), path.name)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(files, sorted(files))
+
+    def test_an_existing_file_is_never_reused(self):
+        logs = self.lab.base / "logs"
+        logs.mkdir()
+        (logs / "2026-06-30_231500_demo.log").write_text("earlier run\n")
+        self.assertEqual(self.run_at_fixed_time("new-run").returncode, 0)
+        self.assertEqual((logs / "2026-06-30_231500_demo.log").read_text(), "earlier run\n")
+        self.assertEqual(len(list(logs.glob("*.log"))), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

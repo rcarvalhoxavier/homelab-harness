@@ -236,7 +236,9 @@ creates on the node, and is installed as `root:root` at an absolute path.
 
 Each run writes an audit log of its actions (not its report) to `logs/` (`HOMELAB_LOG_DIR`, a
 relative path is under the repository; `HOMELAB_LOG=0` turns it off): the file is mode 0600, and
-a directory the tool creates is 0700.
+a directory the tool creates is 0700. Each run has its own file, named
+`<date>_<time>_<tool>.log`; when that name exists already (a second run in the same second) a
+counter follows the tool name: `..._<tool>_02.log`.
 
 ## The dispatcher
 
