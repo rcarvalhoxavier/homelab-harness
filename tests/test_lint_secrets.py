@@ -213,6 +213,22 @@ class HookBypassTest(unittest.TestCase):
         self.git("add", "-A")
         self.assert_blocked()
 
+    def test_findings_name_the_repository_path_when_tmpdir_is_a_symlink(self):
+        # macOS reaches its temporary directory through a symlink (/var -> /private/var);
+        # wiki-lint prints resolved paths, and the hook must still strip its staging directory.
+        real = Path(self.tmp.name) / "real-tmp"
+        real.mkdir()
+        link = Path(self.tmp.name) / "link-tmp"
+        link.symlink_to(real)
+        append(self.root / "wiki" / "overview.md", f"\nLeaked {JWT}\n")
+        self.git("add", "wiki/overview.md")
+        with mock.patch.dict(os.environ, {"TMPDIR": str(link)}):
+            result = self.git("commit", "-qm", "leak")
+        self.assertNotEqual(result.returncode, 0)
+        output = result.stdout + result.stderr
+        self.assertRegex(output, r"(?m)^ERROR wiki/overview\.md:\d+ E-SECRET")
+        self.assertNotIn(str(real), output)
+
     def test_staged_copy_is_scanned_not_the_working_tree(self):
         overview = self.root / "wiki" / "overview.md"
         clean_text = overview.read_text()

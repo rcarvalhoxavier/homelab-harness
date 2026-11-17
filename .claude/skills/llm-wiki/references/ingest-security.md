@@ -25,23 +25,39 @@ every future session that reads it.
 `bin/wiki-capture` redacts, before anything is stored:
 
 - private keys: PEM and PGP blocks (even cut off before their END line), OpenVPN static keys,
-  PuTTY key files, base64-encoded PEM (pfSense/OPNsense `<prv>`);
+  PuTTY key files, base64-encoded PEM (pfSense/OPNsense `<prv>`), age keys
+  (`AGE-SECRET-KEY-1…`);
 - tokens with a known prefix (`ghp_`, `github_pat_`, `glpat-`, `xox?-`, `tskey-`, `sk-`, `AKIA`,
-  `AIza`, `hf_`), bearer and Basic authorization headers, JWTs, Telegram bot tokens;
-- credentials in URLs (`https://user:password@host`, passwords containing `@` or `/`, a token as
-  the user name) and secret query parameters (`?key=`, `?token=`, `?access_token=`);
+  `AIza`, `hf_`), bearer and Basic authorization headers, JWTs, Telegram bot tokens, Slack and
+  Discord webhook URLs;
+- Proxmox API token secrets: the UUID after a token id (`user@realm!tokenid <uuid>` in
+  `token.cfg`, `PVEAPIToken=user@realm!tokenid=<uuid>`), and the `value` that
+  `pveum user token add` prints next to `full-tokenid` (table, JSON or YAML). A UUID with no
+  token id next to it is not redacted: VM, disk and filesystem UUIDs are not secrets;
+- credentials in URLs (`https://user:password@host`, `redis://:password@host`, passwords
+  containing `@` or `/`, a token as the user name) and secret query parameters (`?key=`,
+  `?token=`, `?access_token=`);
 - values of secret-named keys (`password`, `passwd`, `passphrase`, `pwd`, `pw`, `pwhash`,
   `secret`, `token`, `api_key`, `private_key`, `access_key`, `auth_key`, `psk`,
   `pre-shared-key`, `community`, `credentials`, `cookie`, `pin`) in `key=value`, `key: value`,
   `key => value`, JSON, XML elements and attributes, table rows, Compose list items, and YAML
   values on the next line or in a block; a key that starts its line takes the whole rest of it;
-- OpenWrt/UCI keys (`option key '…'`, `….key=`), SNMP communities, Cisco `password`/`secret`
-  lines, `/etc/shadow` and htpasswd hashes;
-- secrets in command lines: `sshpass -p`, `--password X`, `curl -u user:…`, `mysql -p…`,
-  `docker login -p …`;
+- a key named only `*_KEY` (`MEILI_MASTER_KEY=`, `encryption-key:`) when its value is long and
+  all hex or a random-looking mix of cases and digits; `PUBLIC_KEY`, `GPG_KEY` and paths stay;
+- `password VALUE` alone on its line (msmtprc, `.netrc`) and `.netrc`'s
+  `machine … login … password …`; PAM lines such as `password requisite pam_pwquality.so` stay;
+- OpenWrt/UCI keys (`option key '…'`, `….key=`), Debian `wpa-psk`, Postfix `sasl_passwd` lines
+  (`[relay]:587 user:password`), Cisco `password`/`secret` lines, `/etc/shadow` and htpasswd
+  hashes, and bcrypt hashes (`$2a$`, `$2b$`, `$2y$`, also with compose's `$$`) anywhere;
+- SNMP communities: `rocommunity`, `snmp-server community`, `com2sec` lines, and `-c` (with the
+  SNMPv3 passphrases `-A` and `-X`) after `snmpwalk`, `snmpget`, `snmpbulkwalk`, `snmpset` and
+  the other net-snmp tools, not after `ssh -c`, `ping -c` or `tar -c`;
+- secrets in command lines: `sshpass -p`, `--password X`, `qm set --cipassword X`,
+  `curl -u user:…`, `mysql -p…`, `docker login -p …`, `echo user:… | chpasswd`;
 - every value in `.env.local` except those whose names mark them as a location or a name
   (`*_HOST`, `*_USER`, `*_PORT`, `*_STORAGE`, `*_PATH`, …): the tool says when one of those
-  appears in a capture;
+  appears in a capture. Values shorter than 6 characters are never redacted, because they would
+  match ordinary words: a short PIN or code in `.env.local` is not protected;
 - every regex in `wiki/.capture-patterns`: **shapes and prefixes only** (`my-lab-wifi-psk-\w+`),
   because that file is committed. A literal secret goes in `.env.local`.
 
@@ -50,8 +66,10 @@ every future session that reads it.
 Redaction is best effort. **Read every capture in full before it is committed**, looking where
 the rules are weakest:
 
-- a secret with no key next to it (a bare token on its own line, a password in free text);
+- a secret with no key next to it (a bare token on its own line, a password in free text, a
+  Proxmox token secret without its token id);
 - a key name the rules do not know (`wifi_code: …`, a vendor's own format);
+- a `.env.local` value shorter than 6 characters;
 - values in formats the rules do not parse (multi-line JSON strings, binary blobs, base64 of
   anything but a PEM key);
 - anything a warning points at: "random-looking values next to a key" are exactly the
@@ -110,7 +128,8 @@ This is the single exception to "never modify `raw/`":
   (`E-EXPOSURE`). Add your own domains, Wi-Fi names and serial numbers to
   `wiki/.capture-patterns`. A four-part version looks like an address: write it with a `v`
   prefix (`v6.3.0.45`) or after "version", "firmware", "build" or "release", or protect it with
-  `--keep`. Security findings (an API open without authentication, an unpatched service, a port
+  `--keep`, which shields text from these address and hostname rules only, never from the
+  secret rules. Security findings (an API open without authentication, an unpatched service, a port
   forwarded to the internet) must not be written at all.
 
 Switching an existing wiki from `private` to `public` does not clean it: git history keeps every

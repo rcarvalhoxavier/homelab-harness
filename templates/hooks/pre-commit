@@ -15,6 +15,9 @@ fi
 
 staged="$(mktemp -d)"
 trap 'rm -rf "$staged"' EXIT
+# wiki-lint prints resolved paths and the sed at the end strips this directory from them, so
+# resolve it too: on macOS the temporary directory is reached through a symlink.
+staged="$(cd "$staged" && pwd -P)"
 
 # -z keeps unusual file names intact; --no-renames reports a renamed file as added,
 # so its content is scanned like any other.

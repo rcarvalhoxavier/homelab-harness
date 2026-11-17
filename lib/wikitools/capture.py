@@ -201,7 +201,18 @@ def main(argv: list[str] | None = None) -> int:
                 and short_hash(existing.read_bytes()) == digest):
             print(f"unchanged: {existing}")
             raw_rel = f"raw/{existing.name}"
-            if not source_path.exists() and raw_rel != meta["source"]:
+            if source_path.exists():
+                print("  identical evidence already exists: cite it")
+            elif raw_rel == meta["source"]:
+                # The evidence is this capture's own and its source page was deleted: write the
+                # stub again, exactly as the first capture did, so "cite it" never points at
+                # a page that does not exist.
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_text(frontmatter.dumps(meta) + STUB_BODY, encoding="utf-8")
+                print(f"source: {source_path}")
+                print("  identical evidence, but its source page was missing: written again as a "
+                      "stub; ingest it")
+            else:
                 # Re-verification: the evidence exists; the observation today gets a dated source.
                 meta["source"] = raw_rel
                 source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,8 +221,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"source: {source_path}")
                 print("  identical evidence: this source records today's observation of it; "
                       "cite it, and update the entity's update history and last_verified")
-            else:
-                print("  identical evidence already exists: cite it")
             return EXIT_OK
 
     raw_path = raw_dir / f"{name}.txt"

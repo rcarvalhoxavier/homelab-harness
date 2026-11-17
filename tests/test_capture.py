@@ -56,6 +56,21 @@ class CaptureTest(unittest.TestCase):
         self.assertIn("source: raw/2026-06-01-node-status.txt",
                       (self.wiki / "sources" / "2026-06-30-node-recheck.md").read_text())
 
+    def test_a_deleted_source_page_is_written_again(self):
+        # The evidence is still in raw/ but its source page is gone: capturing the same output
+        # under the same name writes the page again instead of pointing at a missing one.
+        self.cap("node-status", "--date", "2026-06-01", stdin="same\n")
+        source = self.wiki / "sources" / "2026-06-01-node-status.md"
+        first = source.read_text()
+        source.unlink()
+        result = self.cap("node-status", "--date", "2026-06-01", stdin="same\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(source.exists(), result.stdout)
+        self.assertEqual(source.read_text(), first)
+        self.assertIn(f"source: {source}", result.stdout)
+        self.assertNotIn("cite it", result.stdout)
+        self.assertEqual(self.raw_files(), ["2026-06-01-node-status.txt"])
+
     def test_raw_is_immutable(self):
         self.cap("node-status", "--date", "2026-06-01", stdin="first\n")
         result = self.cap("node-status", "--date", "2026-06-01", stdin="second\n")
