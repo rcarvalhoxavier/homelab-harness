@@ -178,8 +178,10 @@ Every changing tool:
 Exit codes: 0 done or nothing to do, 1 a check, step or verification failed (or you declined),
 2 usage, configuration, or confirmation needed without a terminal.
 
-The one exception: `pve-update-ct --simulate` runs `pct exec` through the admin alias without
-`--yes`, because a simulation inside a container needs it.
+The one exception: a simulation inside a container (`pve-update-ct` on every run, `pve-cleanup`
+on a container) runs `pct exec` through the admin alias without `--yes`, `--dry-run` included,
+because `pct exec` is not on the collect allowlist. It changes nothing, and it is the only admin
+call before the confirmation.
 
 ### Per-tool behavior
 
@@ -341,6 +343,7 @@ change in any release.
 | `pve_read`, `pve_must_read`, `pve_opt_read` | Collector reads with the failure rules above; redefine `pve_read_failed WHAT` to report a failure |
 | `pve_zpool_read STATUS` | `zpool list` as `pve_opt_read`, but a failed read when `STATUS` (`pvesm status`) lists a `zfspool` storage |
 | `pve_removal_guard NODE LABEL SIMULATION` | The removal guard of an apt simulation (`PVE_REMOVALS`, `PVE_REMOVAL_COUNT`) |
+| `pve_sim_removals WHERE LABEL SIMULATION` | The removals of an apt simulation, read only when its summary line and its `Remv` lines agree (same variables); the guard's first step, and the check of a simulation inside a container |
 | `pve_guests NODE` | `vmid ct\|vm status name` lines |
 | `pve_guest_has_snapshot NODE TYPE VMID NAME` | Three-state: 0 found, 1 absent, 2 unreadable; test for 2 before treating 1 as "absent" |
 | `pve_check_ok`, `pve_check_warn`, `pve_check_fail` | Pre-check lines (`fail` exits 1) |
