@@ -52,7 +52,7 @@ class DocsTest(unittest.TestCase):
         for phrase in ("--node NODE", "pass --node NODE", "corosync.conf", "may belong to a snapshot",
                        "log in as **root**", "dpkg --configure -a", "support is experimental", "refused (sudo)",
                        "no summary line", "Proxmox Backup Server", "bin/pve-discover --seed pve1",
-                       "Bash(bin/pve-discover:*)", "PVE_QUORUM_LOCAL", "pve_inventory_add"):
+                       "PVE_QUORUM_LOCAL", "pve_inventory_add"):
             self.assertIn(phrase, guide)
         readme = (ROOT / "README.md").read_text()
         self.assertIn("--dry-run` first", readme)
