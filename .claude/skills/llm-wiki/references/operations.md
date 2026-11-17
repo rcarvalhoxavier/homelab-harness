@@ -141,7 +141,9 @@ bin/wiki-capture <slug> --file PATH [same options]
   different content, or a stale source page with that name describes other evidence; `3` empty
   input.
 - `unchanged: <path>` means identical evidence already exists somewhere in `raw/`. No raw file is
-  written; a dated source page for today's observation is, pointing at the existing file.
+  written; a dated source page for today's observation is, pointing at the existing file. When
+  that file is this capture's own and its source page was deleted, the page is written again as
+  a stub.
 - It never touches `index.md`, `log.md` or `overview.md`. That is INGEST's job.
 
 ### Re-verification (`W-STALE`)
