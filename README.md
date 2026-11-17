@@ -130,7 +130,8 @@ After that, `git merge upstream/main` works as in Path 1.
 1. Open `wiki/AGENTS.md` and fill in the `[CUSTOMIZE]` sections (what the wiki covers, your host
    names, your vocabulary), removing each marker as you go. Do the same in
    `.claude/rules/local.md`, your installation's agent rules.
-2. Give the agent SSH access that can only read: [`docs/ssh-access.md`](docs/ssh-access.md).
+2. Give the agent SSH access that can only read, and on Proxmox a separate admin alias for
+   changes: [`docs/ssh-access.md`](docs/ssh-access.md).
 3. Proxmox: once the aliases of one node work, `bin/pve-discover --seed pve1` writes
    `inventory/nodes` and prints the first evidence; ask your agent for the DISCOVER operation to
    turn it into pages. Then install the dispatcher and run `bin/pve-selftest`

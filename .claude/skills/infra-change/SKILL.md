@@ -67,15 +67,21 @@ shows the done-criteria.
    and capture it; without a simulation, get explicit acknowledgment that there is no way back.
 5. **Baseline.**
    ```bash
-   <collector> | bin/wiki-capture <target>-baseline --origin "<collector> @ <host>"
+   tmp="$(mktemp)"
+   <collector> > "$tmp"; echo "exit=$?"
+   bin/wiki-capture <target>-baseline --file "$tmp" --origin "<collector> @ <host>"
    ```
-   Read the capture and note the `raw:` path it prints.
+   Keep the collector's exit code before any pipe: the output goes to a file first, and
+   `wiki-capture` reads the file. A failed collection is not evidence: fix it and run it again
+   before capturing. Read the capture and note the `raw:` path it prints.
 6. **Execute.** One command at a time: write it under Execution, get confirmation if it is
    destructive, run it, write its result. Hit an abort condition: stop, go to "When it goes
    wrong".
 7. **After.**
    ```bash
-   <collector> | bin/wiki-capture <target>-after --origin "<collector> @ <host>"
+   tmp="$(mktemp)"
+   <collector> > "$tmp"; echo "exit=$?"
+   bin/wiki-capture <target>-after --file "$tmp" --origin "<collector> @ <host>"
    diff -u <baseline raw: path> <after raw: path>      # the paths the two captures printed
    ```
    `unchanged:` means the state is identical to the baseline (expected after a clean rollback,
@@ -100,12 +106,13 @@ much as a successful one.
 
 ## Boundary with superpowers
 
-- Code (a script, a stack, a migration tool) follows superpowers: spec, plan, implementation,
+- Code (a script, a stack, a migration tool) follows superpowers when it is installed, and
+  otherwise the design, plan and execution flow of `AGENTS.md`: spec, plan, implementation,
   with specs and plans where `.claude/rules/local.md` says. A plan that runs anything on a host
   ends with a deploy task that hands over to this skill, naming the change-record path.
 - The change record lists that code's documents in `specs:` and `plans:` (checked by
   `wiki-lint`); the spec names the change record back.
-- Deploying is one of superpowers' "stops" (outside the worktree): the user and this skill take
+- Deploying is one of that flow's "stops" (outside the worktree): the user and this skill take
   over from there.
 
 ## References

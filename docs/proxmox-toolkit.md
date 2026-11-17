@@ -36,8 +36,9 @@ before changing anything.
 
 ## Setup
 
-1. **SSH aliases for one node.** Follow [`ssh-access.md`](ssh-access.md) for one node: one key for
-   reads (`pve1`), one for changes (`pve1-admin`), both in `~/.ssh/config` with `BatchMode yes`.
+1. **SSH aliases for one node.** Follow steps 1 to 4 of [`ssh-access.md`](ssh-access.md) for one
+   node: they create one key for reads (`pve1`) and one for changes (`pve1-admin`), install both,
+   and define both aliases in `~/.ssh/config` with `BatchMode yes`.
    Every call the toolkit makes passes `-o ControlMaster=no -o ControlPath=none`: both aliases
    reach the same host, and a shared connection would mix the two keys. The admin alias must
    log in as **root**: the changing tools run `pct` and `qm` and install files with
@@ -59,23 +60,16 @@ before changing anything.
    The aliases default to `<node>` and `<node>-admin`; they must differ, and no alias may serve
    two nodes. No addresses or users here: they live in `~/.ssh/config`. Use the Proxmox name in
    the node column: `bin/pve-discover` compares it with the cluster members.
-4. **Dispatcher.** `bin/pve-collect-install pve1 --dry-run`, then without `--dry-run`. Add the
-   printed `command="/usr/local/bin/homelab-collect",restrict` prefix to the read key's line in
+4. **Dispatcher.** `bin/pve-collect-install pve1 --dry-run`, then without `--dry-run` (it connects
+   through the admin alias of step 1). Add the printed
+   `command="/usr/local/bin/homelab-collect",restrict` prefix to the read key's line in
    `authorized_keys` by hand: the tool never edits that file. On a cluster, install on every node
    first: root's `authorized_keys` is shared.
 5. **Check.** `bin/pve-selftest` must pass, including "the collect key is restricted".
 6. **Agent permissions.** Only after step 5, pre-approve the read-only tools in your agent's
-   local, uncommitted permission settings. Every agent has its own mechanism; for Claude Code it
-   is `.claude/settings.local.json`:
-
-   ```json
-   { "permissions": { "allow": [
-     "Bash(bin/pve-state:*)", "Bash(bin/pve-health:*)", "Bash(bin/pve-capacity:*)",
-     "Bash(bin/pve-selftest:*)", "Bash(bin/pve-discover:*)"
-   ] } }
-   ```
-
-   Never pre-approve a changing tool, `pve-selftest --admin`, or `ssh` to an admin alias.
+   local, uncommitted permission settings: the one list is in
+   [`ssh-access.md`](ssh-access.md#6-agent-permissions). `bin/pve-selftest` and `bin/pve-discover`
+   are not on it, and neither is a changing tool or an admin alias; each asks every time.
 
 The wiki side of steps 3 and later is the `llm-wiki` DISCOVER operation: it captures the report,
 writes the first pages, and on later runs lists what changed without rewriting them.
@@ -242,7 +236,7 @@ a directory the tool creates is 0700.
 
 `remote/homelab-collect` runs on each host as the read key's forced command. It runs a command
 only when it matches a line of `/etc/homelab-collect/framework.allow` (from
-`remote/collect.allow`, 34 rules) or `local.allow` (from your `local/collect.allow`) token by
+`remote/collect.allow`, 35 rules) or `local.allow` (from your `local/collect.allow`) token by
 token:
 
 ```text
@@ -269,7 +263,8 @@ cat {aptfile}
 - `homelab-collect --version` prints a hash of the installed files (the first 16 hex digits of
   a sha256 over the dispatcher and both lists, concatenated); `pve-selftest` compares it
   with this repository and tells you to re-run `pve-collect-install` after an upstream merge that
-  changes `remote/`.
+  changes `remote/`. A host keeps the lists it was given: a new rule, in either file, reaches it
+  only when you run `pve-collect-install` again.
 - When the account is not root and the file `/etc/homelab-collect/use-sudo` exists, the dispatcher
   runs each allowed command as `sudo -n` ([`ssh-access.md`](ssh-access.md) §7). It first asks
   `sudo -n -l` whether sudoers allows the command and refuses one that it does not with

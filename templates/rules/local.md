@@ -6,9 +6,10 @@ upstream never ships it, so edit it freely.
 
 ## Where things go here  [CUSTOMIZE]
 
-- Specs and plans for code in this repository (superpowers `brainstorming` and
-  `writing-plans`): specs in `local/docs/specs/`, plans in `local/docs/plans/`. This overrides
-  the superpowers default, `docs/superpowers/`.
+- Specs and plans for code in this repository: specs in `local/docs/specs/`, plans in
+  `local/docs/plans/`. With superpowers installed (`brainstorming`, `writing-plans`) this
+  overrides its default, `docs/superpowers/`; without it, the design, plan and execution flow of
+  `AGENTS.md` writes them there.
 - Scripts and stacks of this installation: `local/`.
 
 ## Rules for this installation  [CUSTOMIZE]

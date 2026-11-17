@@ -4,39 +4,46 @@ The agent runs read-only collectors on your hosts over SSH. It cannot type a pas
 password prompt makes it hang or fail. This guide sets up key-based, non-interactive access
 where any authentication problem fails immediately.
 
-## 1. Create a dedicated key
+## 1. Create the keys
+
+The agent reads with its own key, `homelab_agent`. A Proxmox node also needs a second key,
+`homelab_admin`, for the changes you confirm one by one (step 5 explains why they are separate;
+you install the dispatcher with it). Skip the second key if you only document hosts that are not
+Proxmox nodes.
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/homelab_agent -C "homelab-agent@$(hostname)"
+ssh-keygen -t ed25519 -f ~/.ssh/homelab_admin -C "homelab-admin@$(hostname)"
 ```
 
-Give it a passphrase and load it into `ssh-agent` once per login session; the agent then uses
-the key without any prompt:
+Give each a passphrase and load them into `ssh-agent` once per login session; the agent then
+uses the keys without any prompt:
 
 ```bash
 eval "$(ssh-agent -s)"    # skip if your desktop session already runs an agent
-ssh-add ~/.ssh/homelab_agent
+ssh-add ~/.ssh/homelab_agent ~/.ssh/homelab_admin
 ```
 
 A key without a passphrase also works and survives reboots without `ssh-add`, but anyone who
 copies the file gets the same access to your hosts. Only do that on a machine you fully
 control, with an encrypted disk.
 
-## 2. Install the key on each host
+## 2. Install the keys on each host
 
 ```bash
 ssh-copy-id -i ~/.ssh/homelab_agent.pub root@10.0.0.11
+ssh-copy-id -i ~/.ssh/homelab_admin.pub root@10.0.0.11    # Proxmox nodes only
 ```
 
 **Proxmox cluster:** root's `authorized_keys` is shared by every node of a cluster
-(`/root/.ssh/authorized_keys` points to `/etc/pve/priv/authorized_keys`), so installing the key
+(`/root/.ssh/authorized_keys` points to `/etc/pve/priv/authorized_keys`), so installing a key
 on one node authorizes it on all of them.
 
-On a Raspberry Pi or any host where you do not log in as root, install the key for that user
-(`ssh-copy-id -i ~/.ssh/homelab_agent.pub pi@10.0.0.20`) and grant only what the collectors
-need (step 5).
+On a Raspberry Pi or any host where you do not log in as root, install the agent key for that
+user (`ssh-copy-id -i ~/.ssh/homelab_agent.pub pi@10.0.0.20`) and grant only what the collectors
+need (step 7).
 
-## 3. One `~/.ssh/config` block per host
+## 3. One `~/.ssh/config` block per host, and one for admin
 
 ```sshconfig
 Host pve1
@@ -57,10 +64,25 @@ Host pve1
 - `StrictHostKeyChecking accept-new` records a new host's key on first contact and still refuses
   a key that later changes.
 - `ControlMaster no` and `ControlPath none` turn connection sharing off. The read alias and the
-  admin alias of step 5 reach the same `user@host:port`, so a shared connection (a
+  admin alias below reach the same `user@host:port`, so a shared connection (a
   `ControlMaster auto` in a `Host *` block) would run reads with the admin key, or changes with
   the restricted one. The toolkit passes both options on every call; keep them here for `ssh` by
   hand.
+
+A Proxmox node gets a second block for the admin key, under its own alias. It logs in as root
+and has no restriction, so you never pre-approve it (steps 5 and 6): every command that goes
+through it asks first.
+
+```sshconfig
+Host pve1-admin
+    HostName 10.0.0.11
+    User root
+    IdentityFile ~/.ssh/homelab_admin
+    IdentitiesOnly yes
+    BatchMode yes
+    ControlMaster no
+    ControlPath none
+```
 
 The agent now runs `ssh pve1 pveversion -v`.
 
@@ -68,10 +90,12 @@ The agent now runs `ssh pve1 pveversion -v`.
 
 ```bash
 ssh -o BatchMode=yes pve1 true && echo OK
+ssh -o BatchMode=yes pve1-admin true && echo OK    # Proxmox nodes only
 ```
 
 `Permission denied (publickey)` means the key is not installed for that user, the `User` is
-wrong, or the key is not loaded in `ssh-agent` (`ssh-add -l` lists loaded keys).
+wrong, or the key is not loaded in `ssh-agent` (`ssh-add -l` lists loaded keys). Do this before
+step 5: once the agent key is restricted, `true` is no longer a command it may run.
 
 ## 5. Limit what the agent's key can run (recommended)
 
@@ -86,8 +110,7 @@ So restrict the key on the host itself, with a forced command: whatever the clie
 commands listed in `remote/collect.allow` and your `local/collect.allow`
 (grammar: [`proxmox-toolkit.md`](proxmox-toolkit.md#the-dispatcher)).
 
-1. Install the dispatcher and its lists on each host, through the admin alias (defined at the
-   end of this section):
+1. Install the dispatcher and its lists on each host, through the admin alias (step 3):
 
    ```bash
    bin/pve-collect-install pve1 --dry-run
@@ -119,20 +142,8 @@ commands listed in `remote/collect.allow` and your `local/collect.allow`
    bin/pve-selftest --node pve1               # "the collect key is restricted" must PASS
    ```
 
-The restricted key can only collect. For changes, use a second key without the restriction,
-under its own host alias, and never pre-approve it, so every command it runs asks first. The
-dispatcher installs through this alias, so create it before running the commands above:
-
-```sshconfig
-Host pve1-admin
-    HostName 10.0.0.11
-    User root
-    IdentityFile ~/.ssh/homelab_admin
-    IdentitiesOnly yes
-    BatchMode yes
-    ControlMaster no
-    ControlPath none
-```
+The restricted key can only collect. For changes, the admin key of step 1 has no restriction and
+sits under its own host alias; never pre-approve it, so every command it runs asks first.
 
 ## 6. Agent permissions
 
@@ -147,12 +158,16 @@ Claude Code, `.claude/settings.local.json` (gitignored):
       "Bash(bin/pve-state:*)",
       "Bash(bin/pve-health:*)",
       "Bash(bin/pve-capacity:*)",
-      "Bash(bin/pve-selftest:*)",
       "Bash(ssh pve1 pveversion:*)"
     ]
   }
 }
 ```
+
+Leave `bin/pve-selftest` and `bin/pve-discover` out: they change nothing on a host by default,
+but a prefix rule covers every flag. `pve-selftest --admin` connects through the admin alias,
+and it runs the executable files of `local/selftest.d/` (or of any `--local-dir`) with your
+rights; `pve-discover --seed` writes `inventory/nodes`. Both ask every time, as they should.
 
 Never pre-approve a changing tool, `ssh` to an admin alias, or `ssh` to a host without the
 forced command.

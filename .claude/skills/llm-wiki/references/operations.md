@@ -71,7 +71,8 @@ agent.
 1. Run and capture as above, without `--seed`, as `discovery`. A second capture on the same day
    with different content is `discovery-<HHMM>`: `wiki-capture` exits 2 on a name clash.
 2. Find the latest earlier discovery source (`sources/*-discovery*.md`, by date and name) and its
-   `raw:` file. If the new capture points to that same raw file, nothing changed: log it and stop.
+   `source:` raw file. If the new capture points to that same raw file, nothing changed: log it
+   and stop.
    `unchanged:` alone is not enough: it matches any earlier raw file, possibly an older state.
 3. `diff -u <previous raw> <new raw>`.
 4. Cross the report with the wiki: a live guest with no row in the guest table; a row whose guest
