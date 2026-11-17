@@ -106,12 +106,13 @@ much as a successful one.
 
 ## Boundary with superpowers
 
-- Code (a script, a stack, a migration tool) follows superpowers: spec, plan, implementation,
+- Code (a script, a stack, a migration tool) follows superpowers when it is installed, and
+  otherwise the design, plan and execution flow of `AGENTS.md`: spec, plan, implementation,
   with specs and plans where `.claude/rules/local.md` says. A plan that runs anything on a host
   ends with a deploy task that hands over to this skill, naming the change-record path.
 - The change record lists that code's documents in `specs:` and `plans:` (checked by
   `wiki-lint`); the spec names the change record back.
-- Deploying is one of superpowers' "stops" (outside the worktree): the user and this skill take
+- Deploying is one of that flow's "stops" (outside the worktree): the user and this skill take
   over from there.
 
 ## References
