@@ -20,6 +20,7 @@ pvecm nodes
 ls /etc/pve/nodes
 cat /etc/pve/storage.cfg
 cat /etc/pve/corosync.conf
+cat /etc/pve/jobs.cfg
 lvs --noheadings --units b --nosuffix -o vg_name,lv_name,lv_size,data_percent,metadata_percent --select segtype=thin-pool
 lvs --noheadings --units b --nosuffix -o lv_name,vg_name,lv_size,data_percent
 vgs --noheadings --units b --nosuffix -o vg_name,vg_free

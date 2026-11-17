@@ -12,6 +12,8 @@ FIELDS = {"id": r"[0-9]{1,9}", "storage": r"[A-Za-z][A-Za-z0-9_.-]{0,63}",
           "node": r"[A-Za-z0-9][A-Za-z0-9.-]*", "snap": r"[A-Za-z][A-Za-z0-9_-]{0,39}",
           "aptfile": r"/etc/apt/sources\.list\.d/[A-Za-z0-9_.-]+\.(list|sources)"}
 PROBES = {"id", "homelab-collect --version"}   # sent on purpose: the restriction probe, the version query
+# rules for the agent's own captures (docs/proxmox-toolkit.md): no tool sends them
+CAPTURE_ONLY = {"cat /etc/pve/jobs.cfg"}
 
 RUNS = [
     ("pve-state", "101"), ("pve-state", "200"), ("pve-state", "pve1"),
@@ -112,7 +114,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(sorted(c for c in self.sent - PROBES if not any(matches(r, c) for r in rules())), [])
 
     def test_every_line_of_the_list_is_used(self):
-        self.assertEqual([r for r in rules() if not any(matches(r, c) for c in self.sent)], [])
+        self.assertEqual([r for r in rules() if r not in CAPTURE_ONLY and not any(matches(r, c) for c in self.sent)], [])
 
     def test_the_python_matcher_agrees_with_the_dispatcher(self):
         lab = Lab()

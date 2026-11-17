@@ -242,7 +242,7 @@ a directory the tool creates is 0700.
 
 `remote/homelab-collect` runs on each host as the read key's forced command. It runs a command
 only when it matches a line of `/etc/homelab-collect/framework.allow` (from
-`remote/collect.allow`, 34 rules) or `local.allow` (from your `local/collect.allow`) token by
+`remote/collect.allow`, 35 rules) or `local.allow` (from your `local/collect.allow`) token by
 token:
 
 ```text
@@ -269,7 +269,8 @@ cat {aptfile}
 - `homelab-collect --version` prints a hash of the installed files (the first 16 hex digits of
   a sha256 over the dispatcher and both lists, concatenated); `pve-selftest` compares it
   with this repository and tells you to re-run `pve-collect-install` after an upstream merge that
-  changes `remote/`.
+  changes `remote/`. A host keeps the lists it was given: a new rule, in either file, reaches it
+  only when you run `pve-collect-install` again.
 - When the account is not root and the file `/etc/homelab-collect/use-sudo` exists, the dispatcher
   runs each allowed command as `sudo -n` ([`ssh-access.md`](ssh-access.md) §7). It first asks
   `sudo -n -l` whether sudoers allows the command and refuses one that it does not with
