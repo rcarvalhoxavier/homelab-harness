@@ -99,12 +99,19 @@ pve_guest_status() {
   awk '/^status:/ { print $2 }' <<< "$out"
 }
 
+# pve_listsnapshot_complete: stdin is the output of pct/qm listsnapshot; 0 when it ends in the
+# pseudo-entry row of the current state ("current ... You are here!", after the tree drawing). A
+# snapshot whose name or description holds the word "current" is not that row.
+pve_listsnapshot_complete() {
+  grep -Eq '^[[:space:]`>|-]*current[[:space:]]+You are here!'
+}
+
 # pve_guest_has_snapshot NODE TYPE VMID NAME: 0 = found, 1 = absent, 2 = unreadable (failed read,
 # empty answer, or no "current" line); the stderr of a failed read stays visible.
 pve_guest_has_snapshot() {
   local out
   out="$(pve_collect "$1" "$(pve_cli_of "$2")" listsnapshot "$3")" || return 2
-  grep -q 'current' <<< "$out" || return 2
+  pve_listsnapshot_complete <<< "$out" || return 2
   pve_parse_snapshots <<< "$out" | awk -v want="$4" '$1 == want { found = 1 } END { exit !found }'
 }
 
@@ -131,6 +138,12 @@ pve_require_snapshot_capable() {
     [[ "$key" =~ ^(scsi|virtio|sata|ide|nvme)[0-9]+$ || "$key" == efidisk0 || "$key" == tpmstate0 ]] || continue
     [[ "$value" == /* && "$value" != *media=cdrom* ]] || continue
     pve_check_fail "$key of $type $id is a passthrough device (${value%%,*}), which cannot be snapshotted"
+  done <<< "$config"
+  # A container mount point whose volume starts with / (a bind mount or a device mount) is not a
+  # storage volume: pve_parse_config_volumes skips it, but Proxmox refuses to snapshot the container.
+  while IFS=': ' read -r key value; do
+    [[ "$key" =~ ^mp[0-9]+$ && "$value" == /* ]] || continue
+    pve_check_fail "$key of $type $id mounts the host path ${value%%,*}, which Proxmox cannot snapshot"
   done <<< "$config"
   while read -r key storage volume _; do
     [[ -n "$key" && "$key" != unused* ]] || continue

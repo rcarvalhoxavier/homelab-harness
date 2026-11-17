@@ -7,9 +7,11 @@ PVE_ARG_RE='^[A-Za-z0-9_./:=,@+-]+$'
 PVE_REFUSED_MARKER='homelab-collect: refused'
 # Connection sharing is off: the collect and admin aliases usually reach the same user@host:port,
 # and a shared ControlMaster socket would run reads with the admin key (or changes with the
-# restricted one).
+# restricted one). SendEnv=LC_ALL, with LC_ALL=C in the environment of every call (_pve_exec_ssh),
+# asks a host whose sshd accepts LC_* (the Debian and Proxmox default) to answer in the C locale; a
+# host that does not accept it ignores it, and the parsers then fail closed on non-English output.
 PVE_SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
-              -o ControlMaster=no -o ControlPath=none)
+              -o ControlMaster=no -o ControlPath=none -o SendEnv=LC_ALL)
 
 # _pve_ssh_prefix ssh|scp: set _PVE_SSH_PREFIX to the program and options of one call.
 _pve_ssh_prefix() {
@@ -22,12 +24,13 @@ _pve_ssh_prefix() {
   fi
 }
 
-# _pve_exec_ssh ARGV...: run a prepared call; only the fallback's child process sees SSHPASS.
+# _pve_exec_ssh ARGV...: run a prepared call with LC_ALL=C; only the fallback's child process sees
+# SSHPASS.
 _pve_exec_ssh() {
   if [[ "${HOMELAB_SSHPASS:-0}" == 1 ]]; then
-    SSHPASS="$_PVE_SSHPASS" "$@"
+    LC_ALL=C SSHPASS="$_PVE_SSHPASS" "$@"
   else
-    "$@"
+    LC_ALL=C "$@"
   fi
 }
 

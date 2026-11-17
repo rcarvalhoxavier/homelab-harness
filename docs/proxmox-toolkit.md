@@ -32,7 +32,9 @@ checked: in a Debian 13 container, apt 3.0.3 prints the same summary line, `The 
 will be upgraded:` and `Inst`/`Conf` lines as apt 2 (only `Reading state information...` is
 missing, and the toolkit does not read it); `Remv` lines were not observed. If apt's output
 differs, `pve-update-host`, `pve-update-ct` and `pve-cleanup` fail closed with "no summary line"
-before changing anything.
+before changing anything. The parsers read English output: every ssh call sets `LC_ALL=C` and
+sends it (`-o SendEnv=LC_ALL`), which a host whose sshd accepts `LC_*` honors; the dispatcher fixes
+the locale on its own. Without either, a non-English locale on the host makes them fail closed.
 
 ## Setup
 
@@ -236,7 +238,9 @@ creates on the node, and is installed as `root:root` at an absolute path.
 
 Each run writes an audit log of its actions (not its report) to `logs/` (`HOMELAB_LOG_DIR`, a
 relative path is under the repository; `HOMELAB_LOG=0` turns it off): the file is mode 0600, and
-a directory the tool creates is 0700.
+a directory the tool creates is 0700. Each run has its own file, named
+`<date>_<time>_<tool>.log`; when that name exists already (a second run in the same second) a
+counter follows the tool name: `..._<tool>_02.log`.
 
 ## The dispatcher
 

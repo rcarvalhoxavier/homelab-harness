@@ -155,10 +155,12 @@ class QueryTest(unittest.TestCase):
         self.assertIn("check: scsi1 of vm 200 is a passthrough device (/dev/disk/by-id/ata-EXAMPLE_SERIAL), "
                       "which cannot be snapshotted: FAILED", result.stdout)
 
-    def test_capability_ignores_a_bind_mount(self):
+    def test_capability_fails_on_a_bind_mount(self):
         self.lab.respond("pve1", "pct config 101", stdout=fx.CONFIGS["101"] + "mp0: /mnt/data,mp=/data\n")
         result = self.lab.bash(LOAD + "pve_require_snapshot_capable pve1 ct 101")
-        self.assertEqual(result.stdout, "check: every disk of ct 101 supports snapshots: ok\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "check: mp0 of ct 101 mounts the host path /mnt/data, "
+                                        "which Proxmox cannot snapshot: FAILED\n")
 
     def test_capability_ignores_cdrom_and_none_values(self):
         config = fx.CONFIGS["200"] + "ide0: none,media=cdrom\nsata0: /dev/sr0,media=cdrom\n"

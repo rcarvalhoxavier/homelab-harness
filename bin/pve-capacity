@@ -238,7 +238,7 @@ snap_listed() {
     PVE_READ_NODE="$1"
     if pve_must_read "snapshots of $2 $3" "$(pve_cli_of "$2")" listsnapshot "$3"; then
       # a real listing always has a "current" line; anything else is a broken read
-      if grep -q 'current' <<< "$PVE_READ_OUT"; then
+      if pve_listsnapshot_complete <<< "$PVE_READ_OUT"; then
         SNAPS[$key]="$(pve_parse_snapshots <<< "$PVE_READ_OUT")"
         SNAPS_OK[$key]=1
       else

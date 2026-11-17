@@ -49,7 +49,7 @@ trap '_pve_on_exit $?' EXIT
 # The log records actions (log lines, remote commands and their exit codes), not the report. It is
 # private: a directory the tool creates is 0700, the file 0600.
 pve_audit_start() {
-  local tool="$1" dir file mask
+  local tool="$1" dir file mask stamp n=1
   shift
   [[ "${HOMELAB_LOG:-1}" == 1 ]] || return 0
   dir="${HOMELAB_LOG_DIR:-$PVE_ROOT/logs}"
@@ -60,8 +60,22 @@ pve_audit_start() {
     log_warn "cannot create $dir: audit log disabled"
     return 0
   fi
-  file="$dir/$(date +%Y-%m-%d_%H%M%S)_${tool}.log"
-  if ! { : >> "$file" && chmod 600 "$file"; } 2>/dev/null; then
+  # One file per run: the name has one-second resolution, so when a file of that name exists
+  # (another run of the tool in the same second) a counter is added after the tool name, which sorts
+  # after the first. noclobber makes the creation fail instead of opening an existing file.
+  stamp="$(date +%Y-%m-%d_%H%M%S)"
+  file="$dir/${stamp}_${tool}.log"
+  # a failed creation is retried under the next name only while the file exists (a lost race)
+  until (set -o noclobber; : > "$file") 2>/dev/null; do
+    if [[ ! -e "$file" ]] || ((n >= 99)); then
+      umask "$mask"
+      log_warn "cannot write $file: audit log disabled"
+      return 0
+    fi
+    n=$((n + 1))
+    printf -v file '%s/%s_%s_%02d.log' "$dir" "$stamp" "$tool" "$n"
+  done
+  if ! chmod 600 "$file" 2>/dev/null; then
     umask "$mask"
     log_warn "cannot write $file: audit log disabled"
     return 0
